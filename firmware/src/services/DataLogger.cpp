@@ -1,0 +1,288 @@
+#include "services/DataLogger.h"
+
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+
+namespace lc {
+namespace {
+
+// Roughly what one row costs: two timestamps, one or two numbers per channel,
+// and the quality mask.  Used only for "will this fit" — deliberately generous,
+// because the failure mode of underestimating is the one this whole file exists
+// to prevent.
+std::size_t estimateRowBytes(std::size_t channels, bool includeRaw) {
+  return 28 + channels * (includeRaw ? 26u : 14u) + 8;
+}
+
+}  // namespace
+
+const char* toString(LogStopReason reason) {
+  switch (reason) {
+    case LogStopReason::kNone:        return "none";
+    case LogStopReason::kOperator:    return "operator";
+    case LogStopReason::kFull:        return "medium_full";
+    case LogStopReason::kWriteFailed: return "write_failed";
+    case LogStopReason::kShutdown:    return "shutdown";
+  }
+  return "none";
+}
+
+Status DataLogger::begin() {
+  if (sampleTask_ != kInvalidTask) return ok();
+
+  // kTelemetry: after safety, control and acquisition.  A dataset is a record
+  // of what the rig did, and it must never be the reason the rig did it late.
+  const Result<TaskId> sampler = scheduler_.addPeriodic(
+      "log.sample", 20000, TaskPriority::kTelemetry, sampleTrampoline, this);
+  if (!sampler.ok()) return sampler.error();
+  sampleTask_ = sampler.value();
+
+  // kBackground, and this is where the filesystem is touched.  See the header:
+  // in a cooperative scheduler a flash write blocks the safety pass behind it.
+  const Result<TaskId> flusher = scheduler_.addPeriodic(
+      "log.flush", 500000, TaskPriority::kBackground, flushTrampoline, this);
+  if (!flusher.ok()) return flusher.error();
+  flushTask_ = flusher.value();
+  return ok();
+}
+
+void DataLogger::sampleTrampoline(void* context) {
+  DataLogger* self = static_cast<DataLogger*>(context);
+  self->sampleTick(self->clock_.nowMicros());
+}
+
+void DataLogger::flushTrampoline(void* context) {
+  static_cast<DataLogger*>(context)->flushTick();
+}
+
+void DataLogger::publish(std::uint8_t severity, const char* detail,
+                         ErrorCode code) {
+  Event event;
+  event.type = (severity >= 3) ? EventType::kLoggingStopped
+                               : EventType::kLoggingStarted;
+  event.severity = severity;
+  event.code = code;
+  event.detail = detail;  // static lifetime only
+  event.timestamp = clock_.nowMicros();
+  events_.publish(event);
+}
+
+// ---------------------------------------------------------------------------
+//  Starting and stopping
+// ---------------------------------------------------------------------------
+Status DataLogger::start(const LogSpec& spec, double expectedSeconds) {
+  if (status_.recording) return fail(ErrorCode::kResourceBusy, "already recording");
+  if (sink_ == nullptr) return fail(ErrorCode::kNotSupported, "no log storage");
+  if (spec.channelCount == 0) {
+    return fail(ErrorCode::kInvalidArgument, "a dataset needs at least one channel");
+  }
+  if (spec.channelCount > limits::kMaxLoggedChannels) {
+    return fail(ErrorCode::kOutOfCapacity, "too many channels for one dataset");
+  }
+  if (!(spec.rateHz > 0.0f) || spec.rateHz > kMaxRateHz) {
+    return fail(ErrorCode::kInvalidArgument, "rate must be 0…50 Hz");
+  }
+
+  // Columns are named from the channels as they are NOW.  A dataset whose
+  // header says "mass_01.g" and whose rows came from a channel that has since
+  // been redefined is worse than no header at all.
+  const char* columns[limits::kMaxLoggedChannels * 2];
+  static char names[limits::kMaxLoggedChannels * 2][limits::kKeyLength + limits::kUnitLength + 8];
+  std::size_t columnCount = 0;
+  for (std::size_t i = 0; i < spec.channelCount; ++i) {
+    const ChannelDescriptor* descriptor = channels_.descriptor(spec.channels[i]);
+    if (descriptor == nullptr) {
+      return fail(ErrorCode::kChannelNotFound, "a channel in the list is gone");
+    }
+    if (spec.includeRaw) {
+      std::snprintf(names[columnCount], sizeof(names[0]), "%s.raw",
+                    descriptor->key.c_str());
+      columns[columnCount] = names[columnCount];
+      ++columnCount;
+    }
+    std::snprintf(names[columnCount], sizeof(names[0]), "%s.%s",
+                  descriptor->key.c_str(),
+                  descriptor->unit.empty() ? "value" : descriptor->unit.c_str());
+    columns[columnCount] = names[columnCount];
+    ++columnCount;
+  }
+
+  // Will it fit?  Arithmetic anybody can do, done here so that nobody has to.
+  const std::size_t writable = sink_->writableBytes();
+  const std::size_t perRow = estimateRowBytes(spec.channelCount, spec.includeRaw);
+  if (writable < perRow * 16) {
+    return fail(ErrorCode::kFilesystemFull,
+                "not enough space left to record anything");
+  }
+  if (expectedSeconds > 0.0) {
+    const double needed =
+        static_cast<double>(perRow) * spec.rateHz * expectedSeconds;
+    if (needed > static_cast<double>(writable)) {
+      // Refused with both numbers, at the start, instead of discovered eight
+      // hours in.
+      char detail[limits::kDetailLength];
+      std::snprintf(detail, sizeof(detail), "needs ~%.0f KB, %.0f KB free",
+                    needed / 1024.0, static_cast<double>(writable) / 1024.0);
+      return fail(ErrorCode::kFilesystemFull, detail);
+    }
+  }
+
+  spec_ = spec;
+  status_ = LogStatus{};
+  status_.name = spec.name;
+  status_.channelCount = spec.channelCount;
+  status_.rateHz = spec.rateHz;
+
+  const Status opened = sink_->openSession(spec_, columns, columnCount, status_.id);
+  if (!opened.ok()) return opened;
+
+  periodUs_ = static_cast<Micros>(1e6 / spec.rateHz);
+  lastRowUs_ = 0;
+  buffered_ = 0;
+  status_.recording = true;
+  status_.startedUs = clock_.nowMicros();
+  status_.startedEpochMs = clock_.epochMillis();
+  publish(1, "logging started", ErrorCode::kOk);
+  return ok();
+}
+
+void DataLogger::endSession(LogStopReason reason, const Error& detail) {
+  if (!status_.recording) return;
+
+  // Everything still in RAM belongs to this dataset — but not at the cost of
+  // the reserve.  Rows that no longer fit above it are counted as dropped
+  // rather than written into the space the instrument needs to stay
+  // configurable: the dataset says it lost them, which is the whole point.
+  if (buffered_ > 0 && sink_ != nullptr) {
+    if (sink_->writableBytes() >= buffered_) {
+      const Status written = sink_->appendRows(buffer_, buffered_);
+      if (written.ok()) {
+        status_.bytesWritten += buffered_;
+      } else {
+        status_.droppedRows += 1;
+      }
+    } else {
+      // One buffer's worth of rows; the count is approximate by exactly the
+      // amount the buffer holds, and saying so beats pretending otherwise.
+      status_.droppedRows += 1;
+    }
+    buffered_ = 0;
+  }
+
+  status_.recording = false;
+  status_.stopReason = reason;
+  status_.lastError = detail;
+  status_.truncated =
+      (reason == LogStopReason::kFull || reason == LogStopReason::kWriteFailed);
+  if (status_.truncated) truncationNotice_ = true;
+
+  if (sink_ != nullptr) sink_->closeSession(status_);
+
+  publish(status_.truncated ? 4 : 1,
+          status_.truncated ? "the dataset was truncated: the medium is full"
+                            : "logging stopped",
+          detail.code);
+}
+
+Status DataLogger::stop(LogStopReason reason) {
+  if (!status_.recording) return fail(ErrorCode::kInvalidState, "not recording");
+  endSession(reason, ok());
+  return ok();
+}
+
+bool DataLogger::takeTruncationNotice() {
+  const bool notice = truncationNotice_;
+  truncationNotice_ = false;
+  return notice;
+}
+
+// ---------------------------------------------------------------------------
+//  Sampling
+// ---------------------------------------------------------------------------
+void DataLogger::appendRow(Micros now) {
+  char row[512];
+  std::size_t used = 0;
+
+  const Micros elapsedMs = (now - status_.startedUs) / 1000ULL;
+  const EpochMs epoch = clock_.epochMillis();
+  used += static_cast<std::size_t>(std::snprintf(
+      row + used, sizeof(row) - used, "%llu,%llu",
+      static_cast<unsigned long long>(elapsedMs),
+      static_cast<unsigned long long>(epoch)));
+
+  // One bit per channel: set when that channel's value was anything other than
+  // GOOD at this instant.  Cheaper than a quality column per channel and, more
+  // importantly, impossible to leave out of a row.
+  std::uint32_t qualityMask = 0;
+
+  for (std::size_t i = 0; i < spec_.channelCount && used < sizeof(row) - 48; ++i) {
+    const ChannelValue* value = channels_.value(spec_.channels[i]);
+    const ChannelDescriptor* descriptor = channels_.descriptor(spec_.channels[i]);
+    const std::uint8_t precision = (descriptor != nullptr) ? descriptor->precision : 3;
+
+    if (value == nullptr) {
+      // The channel disappeared mid-session (its device was removed).  The
+      // column stays — a dataset whose column count changes halfway through is
+      // not a dataset — and the quality bit says why it is empty.
+      qualityMask |= (1u << i);
+      used += static_cast<std::size_t>(std::snprintf(
+          row + used, sizeof(row) - used, spec_.includeRaw ? ",," : ","));
+      continue;
+    }
+    if (value->quality != ChannelQuality::kGood) qualityMask |= (1u << i);
+
+    if (spec_.includeRaw) {
+      used += static_cast<std::size_t>(std::snprintf(
+          row + used, sizeof(row) - used, ",%.6g", static_cast<double>(value->raw)));
+    }
+    used += static_cast<std::size_t>(std::snprintf(
+        row + used, sizeof(row) - used, ",%.*f", static_cast<int>(precision),
+        static_cast<double>(value->processed)));
+  }
+
+  used += static_cast<std::size_t>(std::snprintf(
+      row + used, sizeof(row) - used, ",%u\n", qualityMask));
+
+  if (buffered_ + used > kBufferBytes) {
+    // The medium is not keeping up.  Counted, reported in the footer and in the
+    // index, and never quietly skipped.
+    ++status_.droppedRows;
+    return;
+  }
+  std::memcpy(buffer_ + buffered_, row, used);
+  buffered_ += used;
+  ++status_.rows;
+}
+
+void DataLogger::sampleTick(Micros now) {
+  if (!status_.recording) return;
+  if (lastRowUs_ != 0 && now - lastRowUs_ < periodUs_) return;
+  lastRowUs_ = now;
+  appendRow(now);
+}
+
+void DataLogger::flushTick() {
+  if (sink_ == nullptr) return;
+  if (!status_.recording || buffered_ == 0) return;
+
+  // The reserve check happens BEFORE the write, not after a failure: the point
+  // is that the instrument keeps enough room to serve its own interface and
+  // save its configuration, whatever the dataset is doing.
+  if (sink_->writableBytes() < buffered_) {
+    endSession(LogStopReason::kFull,
+               fail(ErrorCode::kFilesystemFull,
+                    "the medium reached its reserve; the run continues"));
+    return;
+  }
+
+  const Status written = sink_->appendRows(buffer_, buffered_);
+  if (!written.ok()) {
+    endSession(LogStopReason::kWriteFailed, written);
+    return;
+  }
+  status_.bytesWritten += buffered_;
+  buffered_ = 0;
+}
+
+}  // namespace lc

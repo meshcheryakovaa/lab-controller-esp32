@@ -1,0 +1,47 @@
+/* Instrument-panel base: dense, quiet, high-contrast where it matters.
+   Tokens live here so widgets never hard-code a colour. */
+:root {
+  --bg: #0d1117;
+  --surface: #131a23;
+  --surface-2: #1b242f;
+  --line: #24303d;
+  --text: #dce3ea;
+  --muted: #7d8b9a;
+  --accent: #4c9aff;
+  --ok: #3fb950;
+  --warn: #d29922;
+  --danger: #f85149;
+  --font-ui: ui-sans-serif, system-ui, "Segoe UI", Roboto, sans-serif;
+  --font-mono: ui-monospace, "JetBrains Mono", "SF Mono", Menlo, monospace;
+}
+
+@media (prefers-color-scheme: light) {
+  :root[data-theme='auto'] {
+    --bg: #f5f7fa; --surface: #ffffff; --surface-2: #eef2f6; --line: #d8e0e8;
+    --text: #16202b; --muted: #5b6b7c;
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Measurements are always monospaced: digits must not jitter as they update. */
+.value, .numeric { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+
+input, select, button { font-family: inherit; font-size: inherit; }
+input, select {
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 0.4rem 0.55rem;
+}
+input:focus, select:focus { outline: 2px solid var(--accent); outline-offset: -1px; }

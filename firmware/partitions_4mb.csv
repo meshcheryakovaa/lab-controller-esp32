@@ -1,0 +1,18 @@
+# Universal ESP32 Laboratory Controller — 4 MB flash layout (ESP32 DevKit)
+# Two OTA slots so a failed firmware update can roll back, plus a LittleFS
+# partition that survives OTA (frontend + user configuration live there).
+#
+#  The LittleFS partition is NAMED "spiffs".  It is not a typo and it is not a
+#  leftover: Arduino-ESP32's LittleFS.begin() defaults to partition LABEL
+#  "spiffs", and a partition named anything else mounts only if every call site
+#  passes the label explicitly.  A partition table that says "littlefs" produces
+#  a board that formats itself on every boot and serves no frontend, with the
+#  only clue being one line about a failed mount.  Milestone 12.
+#
+# Name,     Type, SubType,  Offset,   Size,     Flags
+nvs,        data, nvs,      0x9000,   0x5000,
+otadata,    data, ota,      0xE000,   0x2000,
+app0,       app,  ota_0,    0x10000,  0x1A0000,
+app1,       app,  ota_1,    0x1B0000, 0x1A0000,
+spiffs,     data, spiffs,   0x350000, 0xA0000,
+coredump,   data, coredump, 0x3F0000, 0x10000,
