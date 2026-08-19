@@ -11,9 +11,6 @@ frontend/dist/
 frontend/.svelte-kit/
 frontend/stats.html
 
-# Frontend build output that is copied into the LittleFS image
-firmware/data/www/
-
 # Local
 *.log
 .DS_Store
