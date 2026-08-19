@@ -4,7 +4,10 @@
 #include <LittleFS.h>
 #include <esp_log.h>
 
+#include <cerrno>
+#include <cstdio>
 #include <cstring>
+#include <sys/stat.h>
 
 namespace lc {
 namespace platform {
@@ -30,17 +33,43 @@ Status LittleFsBackend::mount(bool formatOnFail) {
   return ok();
 }
 
-bool LittleFsBackend::exists(const char* path) const {
-  return mounted_ && LittleFS.exists(path);
-}
+ bool LittleFsBackend::exists(const char* path) const {
+  if (!mounted_ || path == nullptr || path[0] != '/') return false;
+
+  char fullPath[160];
+  const int written = std::snprintf(fullPath, sizeof(fullPath), "%s%s",
+                                    kMountPoint, path);
+  if (written < 0 || static_cast<std::size_t>(written) >= sizeof(fullPath)) {
+    return false;
+  }
+
+  struct stat info {};
+  return ::stat(fullPath, &info) == 0;
+ }
 
 Result<std::size_t> LittleFsBackend::size(const char* path) const {
   if (!mounted_) return fail(ErrorCode::kStorageFailure, "not mounted");
-  File file = LittleFS.open(path, "r");
-  if (!file) return fail(ErrorCode::kNotFound, path);
-  const std::size_t bytes = file.size();
-  file.close();
-  return bytes;
+  if (path == nullptr || path[0] != '/') {
+    return fail(ErrorCode::kInvalidArgument, "path");
+  }
+
+  char fullPath[160];
+  const int written = std::snprintf(fullPath, sizeof(fullPath), "%s%s",
+                                    kMountPoint, path);
+  if (written < 0 || static_cast<std::size_t>(written) >= sizeof(fullPath)) {
+    return fail(ErrorCode::kInvalidArgument, "path too long");
+  }
+
+  struct stat info {};
+  if (::stat(fullPath, &info) != 0) {
+    return (errno == ENOENT)
+               ? fail(ErrorCode::kNotFound, path)
+               : fail(ErrorCode::kStorageFailure, path);
+  }
+  if (S_ISDIR(info.st_mode)) {
+    return fail(ErrorCode::kInvalidArgument, "path is a directory");
+  }
+  return static_cast<std::size_t>(info.st_size);
 }
 
 Result<std::size_t> LittleFsBackend::read(const char* path, char* buffer,
@@ -49,6 +78,7 @@ Result<std::size_t> LittleFsBackend::read(const char* path, char* buffer,
   if (buffer == nullptr || capacity == 0) {
     return fail(ErrorCode::kInvalidArgument, "no buffer");
   }
+  if (!exists(path)) return fail(ErrorCode::kNotFound, path);
   File file = LittleFS.open(path, "r");
   if (!file) return fail(ErrorCode::kNotFound, path);
 
@@ -102,9 +132,10 @@ Status LittleFsBackend::writeAtomic(const char* path, const char* data,
     }
   }
 
-  // rename() in LittleFS replaces the target atomically.  This is the moment
-  // the new configuration becomes visible; everything before it is reversible.
-  LittleFS.remove(path);
+  // rename() replaces an existing target atomically.  Do not remove the
+  // target first: besides producing a false error on first save, that would
+  // introduce a power-loss window in which neither version exists.
+
   if (!LittleFS.rename(temporary, path)) {
     LittleFS.remove(temporary);
     return fail(ErrorCode::kStorageFailure, "rename failed");
@@ -114,6 +145,7 @@ Status LittleFsBackend::writeAtomic(const char* path, const char* data,
 
 Status LittleFsBackend::remove(const char* path) {
   if (!mounted_) return fail(ErrorCode::kStorageFailure, "not mounted");
+  if (!exists(path)) return fail(ErrorCode::kNotFound, path);
   return LittleFS.remove(path) ? ok() : fail(ErrorCode::kNotFound, path);
 }
 

@@ -17,6 +17,7 @@
 #include "modules/processing/MathProcessors.h"
 #include "modules/processing/MovingAverageProcessor.h"
 #include "modules/sensors/Aht20Driver.h"
+#include "modules/sensors/AdditionalSensors.h"
 #include "modules/sensors/BasicInputs.h"
 #include "modules/sensors/Bmp280Driver.h"
 #include "modules/sensors/Hx711Driver.h"
@@ -36,6 +37,16 @@ void registerBuiltinModules(ModuleRegistry& registry) {
                                 &Aht20Driver::create, nullptr, nullptr});
   registry.add(ModuleDescriptor{&Bmp280Driver::manifest(),
                                 &Bmp280Driver::create, nullptr, nullptr});
+  registry.add(ModuleDescriptor{&Bme280Driver::manifest(),
+                                &Bme280Driver::create, nullptr, nullptr});
+  registry.add(ModuleDescriptor{&Ds18b20Driver::manifest(),
+                                &Ds18b20Driver::create, nullptr, nullptr});
+  registry.add(ModuleDescriptor{&Dht11Driver::manifest(),
+                                &Dht11Driver::create, nullptr, nullptr});
+  registry.add(ModuleDescriptor{&Vl53l0xDriver::manifest(),
+                                &Vl53l0xDriver::create, nullptr, nullptr});
+  registry.add(ModuleDescriptor{&Mlx90614Driver::manifest(),
+                                &Mlx90614Driver::create, nullptr, nullptr});
   registry.add(ModuleDescriptor{&AnalogInputDriver::manifest(),
                                 &AnalogInputDriver::create, nullptr, nullptr});
   registry.add(ModuleDescriptor{&DigitalInputDriver::manifest(),
@@ -76,12 +87,6 @@ void registerBuiltinModules(ModuleRegistry& registry) {
   registry.add(ModuleDescriptor{&ClampProcessor::manifest(), nullptr,
                                 &ClampProcessor::create, nullptr});
 
-  // --- milestone 2.1 -------------------------------------------------------
-  // DS18B20 needs a 1-Wire port.  Bit-banging 1-Wire from a cooperative task is
-  // unreliable (the reset pulse alone is 480 µs of exact timing, and any
-  // interruption corrupts the frame), so it will be built on the ESP32's RMT
-  // peripheral, which generates and samples the waveform in hardware.  That is
-  // a self-contained piece of work rather than another driver.
 }
 
 }  // namespace lc

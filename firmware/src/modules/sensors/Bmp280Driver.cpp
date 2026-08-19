@@ -221,14 +221,10 @@ Status Bmp280Driver::begin() {
     state_ = DeviceState::kError;
     return lastError_;
   }
-  if (chipId.value() != Bmp280Protocol::kChipIdBmp280) {
-    // This is the difference between a scan hint and a fact: the address said
-    // "maybe BMP280", the chip ID says what it actually is.
-    lastError_ = (chipId.value() == Bmp280Protocol::kChipIdBme280)
-                     ? fail(ErrorCode::kDeviceConfigInvalid,
-                            "this is a BME280, not a BMP280")
-                     : fail(ErrorCode::kDeviceNotResponding,
-                            "unexpected chip ID at this address");
+  if (chipId.value() != Bmp280Protocol::kChipIdBmp280 &&
+      chipId.value() != Bmp280Protocol::kChipIdBme280) {
+    lastError_ = fail(ErrorCode::kDeviceNotResponding,
+                      "unexpected chip ID at this address");
     state_ = DeviceState::kError;
     return lastError_;
   }
@@ -346,7 +342,8 @@ Status Bmp280Driver::selfTest() {
   const Result<std::uint8_t> chipId =
       bus_->readRegister(address_, Bmp280Protocol::kRegChipId);
   if (!chipId.ok()) return chipId.error();
-  if (chipId.value() != Bmp280Protocol::kChipIdBmp280) {
+  if (chipId.value() != Bmp280Protocol::kChipIdBmp280 &&
+      chipId.value() != Bmp280Protocol::kChipIdBme280) {
     return fail(ErrorCode::kDeviceNotResponding, "unexpected chip ID");
   }
   return calibration_.plausible()
