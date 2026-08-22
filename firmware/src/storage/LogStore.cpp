@@ -5,11 +5,14 @@
 #include <cstring>
 #include <new>
 
+#include "core/Format.h"
+#include "core/MemoryDiagnostics.h"
 #include "storage/JsonUtils.h"
 
 namespace lc {
 
 Status LogStore::begin() {
+  const LockGuard held(mutex_);
   const Status directory = backend_.ensureDirectory(kDirectory);
   if (!directory.ok()) return directory;
   // Sort out what a power cut left behind before anything can read the index
@@ -18,6 +21,7 @@ Status LogStore::begin() {
 }
 
 std::uint32_t LogStore::takeSegmentReadyNotice() {
+  const LockGuard held(mutex_);
   const std::uint32_t ready = segmentReadyNotice_;
   segmentReadyNotice_ = 0;
   return ready;
@@ -29,6 +33,7 @@ std::size_t LogStore::writableBytes() const {
 }
 
 Status LogStore::loadIndex(JsonDocument& out) const {
+  const LockGuard held(mutex_);
   out.clear();
   if (!backend_.exists(kIndexPath)) {
     JsonObject root = out.to<JsonObject>();
@@ -73,6 +78,7 @@ Status LogStore::saveIndex(JsonDocument& document) {
 }
 
 std::size_t LogStore::sessionCount() const {
+  const LockGuard held(mutex_);
   JsonDocument index;
   if (!loadIndex(index).ok()) return 0;
   return index["logs"].as<JsonArrayConst>().size();
@@ -83,18 +89,33 @@ Status LogStore::writeHeader(const LogSpec& spec, const char* const* columns,
   // The column line is kept because every SEGMENT needs it: each part of a
   // continuous session is a valid CSV on its own, and one that inherited its
   // column names from a file the reader may never have received would not be.
+  //
+  // A truncated column line is not a cosmetic problem.  It is a CSV whose
+  // header names fewer columns than the rows contain, or names one of them
+  // half-way through — a file that every parser reads differently and none
+  // rejects.  So this REFUSES rather than truncates (0.15.1-m15).
   std::size_t line = 0;
-  line += static_cast<std::size_t>(std::snprintf(
-      columnLine_ + line, sizeof(columnLine_) - line, "t_ms,epoch_ms"));
+  bool complete =
+      appendFormat(columnLine_, sizeof(columnLine_), line, "t_ms,epoch_ms");
   if (spec.storageMode == LogStorageMode::kContinuousOffload) {
-    line += static_cast<std::size_t>(std::snprintf(
-        columnLine_ + line, sizeof(columnLine_) - line, ",global_row"));
+    complete &= appendFormat(columnLine_, sizeof(columnLine_), line, ",global_row");
   }
-  for (std::size_t i = 0; i < columnCount && line < sizeof(columnLine_) - 48; ++i) {
-    line += static_cast<std::size_t>(std::snprintf(
-        columnLine_ + line, sizeof(columnLine_) - line, ",%s", columns[i]));
+  for (std::size_t i = 0; i < columnCount; ++i) {
+    complete &=
+        appendFormat(columnLine_, sizeof(columnLine_), line, ",%s", columns[i]);
   }
-  std::snprintf(columnLine_ + line, sizeof(columnLine_) - line, ",quality_mask");
+  complete &= appendFormat(columnLine_, sizeof(columnLine_), line, ",quality_mask");
+
+  if (!complete) {
+    // kColumnLineBytes is derived from kMaxLoggedChannels and the key/unit
+    // lengths, so a rig the logger accepts always fits.  Reaching this means
+    // one of those limits moved without the arithmetic moving with it.
+    columnLine_[0] = '\0';
+    columnLineLength_ = 0;
+    return fail(ErrorCode::kOutOfCapacity,
+                "the column names do not fit in one header line");
+  }
+  columnLineLength_ = line;
   return ok();
 }
 
@@ -105,69 +126,107 @@ Status LogStore::writeHeader(const LogSpec& spec, const char* const* columns,
  */
 Status LogStore::ensureSegmentHeader(std::uint32_t firstGlobalRow) {
   if (headerWritten_) return ok();
-
-  char header[1024];
-  std::size_t used = 0;
-
-  used += static_cast<std::size_t>(std::snprintf(
-      header + used, sizeof(header) - used,
-      "# dataset: %s\n", currentId_.c_str()));
-  if (mode_ == LogStorageMode::kContinuousOffload) {
-    used += static_cast<std::size_t>(std::snprintf(
-        header + used, sizeof(header) - used,
-        "# segment: %u\n# mode: %s\n",
-        static_cast<unsigned>(sequence_), toString(mode_)));
+  if (columnLineLength_ == 0) {
+    return fail(ErrorCode::kInvalidState, "the column line was never built");
   }
-  used += static_cast<std::size_t>(std::snprintf(
-      header + used, sizeof(header) - used,
+
+  char header[kHeaderBytes];
+  std::size_t used = 0;
+  // Every fragment is checked (core/Format.h).  The version of this function
+  // that summed snprintf return values could leave `used` well past
+  // sizeof(header) — and then handed that number to backend_.append() as the
+  // length to write, so the filesystem read several hundred bytes of whatever
+  // followed the buffer and put them in the dataset.
+  bool complete = appendFormat(header, sizeof(header), used,
+                               "# dataset: %s\n", currentId_.c_str());
+  if (mode_ == LogStorageMode::kContinuousOffload) {
+    complete &= appendFormat(header, sizeof(header), used,
+                             "# segment: %u\n# mode: %s\n",
+                             static_cast<unsigned>(sequence_), toString(mode_));
+  }
+  complete &= appendFormat(
+      header, sizeof(header), used,
       "# name: %s\n# experiment: %s\n# operator: %s\n# sample: %s\n",
       spec_.name.c_str(),
       spec_.experiment.empty() ? "(manual)" : spec_.experiment.c_str(),
       spec_.operatorName.empty() ? "(unknown)" : spec_.operatorName.c_str(),
-      spec_.sample.empty() ? "(unspecified)" : spec_.sample.c_str()));
+      spec_.sample.empty() ? "(unspecified)" : spec_.sample.c_str());
 
-  used += static_cast<std::size_t>(std::snprintf(
-      header + used, sizeof(header) - used,
+  complete &= appendFormat(
+      header, sizeof(header), used,
       "# firmware: %s\n# config_fingerprint: %08x\n# config_revision: %u\n"
       "# rate_hz: %.4g\n",
       LC_FIRMWARE_VERSION, static_cast<unsigned>(storage_.fingerprint()),
       static_cast<unsigned>(storage_.revision()),
-      static_cast<double>(spec_.rateHz)));
+      static_cast<double>(spec_.rateHz));
 
   if (mode_ == LogStorageMode::kContinuousOffload) {
     // Enough to detect a missing part by reading two files, without an index.
-    used += static_cast<std::size_t>(std::snprintf(
-        header + used, sizeof(header) - used,
-        "# first_global_row: %u\n# previous_segment: %u\n",
-        static_cast<unsigned>(firstGlobalRow),
-        static_cast<unsigned>(previousSegment_)));
+    complete &= appendFormat(header, sizeof(header), used,
+                             "# first_global_row: %u\n# previous_segment: %u\n",
+                             static_cast<unsigned>(firstGlobalRow),
+                             static_cast<unsigned>(previousSegment_));
+  }
+  if (!complete) {
+    // The fixed part of the header did not fit, which no configuration should
+    // be able to arrange — every field in it is a bounded FixedString.
+    return fail(ErrorCode::kOutOfCapacity, "the dataset header does not fit");
   }
 
   // Which calibrations produced the units in the column names.  Without this
   // line the numbers are grams only by assertion.
-  used += static_cast<std::size_t>(std::snprintf(
-      header + used, sizeof(header) - used, "# calibrations:"));
+  //
+  // This list is the one genuinely unbounded part: a rig may have far more
+  // calibrations than a 1 KiB header can name.  So it is cut DELIBERATELY and
+  // the header says how many it left out, rather than stopping at whatever
+  // happened to fit and reading as a complete list.
+  appendFormat(header, sizeof(header), used, "# calibrations:");
+  const std::size_t reserve = 48;  // room for " (+NN more)\n" and a margin
   std::size_t listed = 0;
+  std::size_t omitted = 0;
   if (calibrations_ != nullptr) {
-    for (std::size_t i = 0; i < calibrations_->count() && used < sizeof(header) - 96; ++i) {
+    for (std::size_t i = 0; i < calibrations_->count(); ++i) {
       const ActiveCalibration& record = calibrations_->at(i);
-      used += static_cast<std::size_t>(std::snprintf(
-          header + used, sizeof(header) - used, "%s %s=%s",
-          listed == 0 ? "" : ",", record.channel.c_str(), record.id.c_str()));
+      std::size_t attempt = used;
+      const bool fitted =
+          appendFormat(header, sizeof(header) - reserve, attempt, "%s %s=%s",
+                       listed == 0 ? "" : ",", record.channel.c_str(),
+                       record.id.c_str());
+      if (!fitted) {
+        // Rewound: a half-written entry would name a calibration that is not
+        // the one that produced the column.
+        header[used] = '\0';
+        omitted = calibrations_->count() - i;
+        break;
+      }
+      used = attempt;
       ++listed;
     }
   }
-  if (listed == 0) {
-    used += static_cast<std::size_t>(std::snprintf(
-        header + used, sizeof(header) - used, " none"));
+  if (listed == 0 && omitted == 0) {
+    appendFormat(header, sizeof(header), used, " none");
   }
-  used += static_cast<std::size_t>(std::snprintf(
-      header + used, sizeof(header) - used, "\n%s\n", columnLine_));
+  if (omitted > 0) {
+    appendFormat(header, sizeof(header), used, " (+%u more)",
+                 static_cast<unsigned>(omitted));
+  }
+  appendFormat(header, sizeof(header), used, "\n");
 
-  const Status written =
-      backend_.append(currentPath_.c_str(), header, used);
+  const Status written = backend_.append(currentPath_.c_str(), header, used);
   if (!written.ok()) return written;
   segmentBytes_ += used;
+
+  // The column line goes to the file as its own append, and never through the
+  // header buffer.  It is up to kColumnLineBytes long on a full rig, which no
+  // sane header buffer could also hold — trying to make it was what turned a
+  // truncation into an over-read.
+  const Status columns =
+      backend_.append(currentPath_.c_str(), columnLine_, columnLineLength_);
+  if (!columns.ok()) return columns;
+  const Status newline = backend_.append(currentPath_.c_str(), "\n", 1);
+  if (!newline.ok()) return newline;
+  segmentBytes_ += columnLineLength_ + 1;
+
   headerWritten_ = true;
   return ok();
 }
@@ -198,6 +257,7 @@ Status LogStore::openSegment(std::uint32_t sequence) {
 
 Status LogStore::openSession(const LogSpec& spec, const char* const* columns,
                              std::size_t columnCount, KeyString& id) {
+  const LockGuard held(mutex_);
   if (open_) return fail(ErrorCode::kResourceBusy, "a dataset is already open");
 
   JsonDocument index;
@@ -244,7 +304,10 @@ Status LogStore::openSession(const LogSpec& spec, const char* const* columns,
   spec_ = spec;
   collectorId_ = spec.collectorId;
   previousSegment_ = 0;
-  writeHeader(spec, columns, columnCount);   // builds columnLine_ only
+  // Checked: this builds columnLine_, and a dataset whose column line did not
+  // fit must never reach the disk (0.15.1-m15).
+  const Status columnsBuilt = writeHeader(spec, columns, columnCount);
+  if (!columnsBuilt.ok()) return columnsBuilt;
 
   if (mode_ == LogStorageMode::kContinuousOffload) {
     openSegment(1);
@@ -389,8 +452,13 @@ Status LogStore::finalizeSegment(bool truncated, std::uint32_t nextSequence) {
     return ok();
   }
   char footer[320];
-  const int used = std::snprintf(
-      footer, sizeof(footer),
+  std::size_t used = 0;
+  // The footer carries the checksum that authorises deleting this file, so a
+  // truncated one is not a cosmetic loss: it is a segment that can never be
+  // acknowledged and therefore sits in the queue for ever.  kSegmentFooterReserve
+  // is what appendRows keeps free for exactly these bytes.
+  const bool complete = appendFormat(
+      footer, sizeof(footer), used,
       "# segment_complete\n# segment_rows: %u\n# first_global_row: %u\n"
       "# last_global_row: %u\n# dropped_rows_total: %u\n"
       "# payload_bytes: %u\n# payload_crc32: %08x\n%s",
@@ -403,11 +471,11 @@ Status LogStore::finalizeSegment(bool truncated, std::uint32_t nextSequence) {
       truncated
           ? "# RECOVERED_TRUNCATED: power was lost while this part was open\n"
           : "");
+  if (!complete) return fail(ErrorCode::kInternal, "the segment footer does not fit");
   if (used > 0) {
-    const Status written =
-        backend_.append(currentPath_.c_str(), footer, static_cast<std::size_t>(used));
+    const Status written = backend_.append(currentPath_.c_str(), footer, used);
     if (!written.ok()) return written;
-    segmentBytes_ += static_cast<std::size_t>(used);
+    segmentBytes_ += used;
   }
   const Status recorded = recordSegmentInIndex(truncated, nextSequence);
   if (!recorded.ok()) return recorded;
@@ -437,6 +505,7 @@ Status LogStore::refreshActiveInIndex() {
 }
 
 Status LogStore::appendRows(const LogBatch& batch) {
+  const LockGuard held(mutex_);
   if (!open_) return fail(ErrorCode::kInvalidState, "no dataset is open");
   if (batch.bytes == 0) return ok();
   droppedAtSegmentEnd_ = batch.droppedRowsTotal;
@@ -447,11 +516,15 @@ Status LogStore::appendRows(const LogBatch& batch) {
     // single oversized batch from closing an empty part behind it.
     const std::size_t projected = segmentBytes_ + batch.bytes + kSegmentFooterReserve;
     if (segmentRows_ > 0 && projected > segmentLimit_) {
+      LC_MEM_REPORT("before segment rotate");
+      LC_MEM_CHECK("before segment rotate");
       const std::uint32_t next = sequence_ + 1;
       const Status closed = finalizeSegment(false, next);
       if (!closed.ok()) return closed;
       const Status opened = openSegment(next);
       if (!opened.ok()) return opened;
+      LC_MEM_REPORT("after segment rotate");
+      LC_MEM_CHECK("after segment rotate");
     }
     // Room for this batch AND for the footer that will close the part.  A file
     // whose footer did not fit cannot be verified, and an unverifiable file can
@@ -487,6 +560,7 @@ Status LogStore::appendRows(const LogBatch& batch) {
 }
 
 void LogStore::closeSession(const LogStatus& status) {
+  const LockGuard held(mutex_);
   if (!open_) return;
   droppedAtSegmentEnd_ = status.droppedRows;
 
@@ -498,16 +572,17 @@ void LogStore::closeSession(const LogStatus& status) {
     // The footer.  A dataset that simply stops is a dataset somebody will assume
     // is complete, so every one of them ends with a line that says how.
     char footer[256];
-    const int used = std::snprintf(
-        footer, sizeof(footer),
-        "# ended: %s\n# rows: %u\n# dropped_rows: %u\n%s",
-        toString(status.stopReason), static_cast<unsigned>(status.rows),
-        static_cast<unsigned>(status.droppedRows),
-        status.truncated
-            ? "# TRUNCATED: the medium reached its reserve; this dataset is incomplete\n"
-            : "# complete\n");
+    std::size_t used = 0;
+    appendFormat(footer, sizeof(footer), used,
+                 "# ended: %s\n# rows: %u\n# dropped_rows: %u\n%s",
+                 toString(status.stopReason), static_cast<unsigned>(status.rows),
+                 static_cast<unsigned>(status.droppedRows),
+                 status.truncated
+                     ? "# TRUNCATED: the medium reached its reserve; this dataset"
+                       " is incomplete\n"
+                     : "# complete\n");
     if (used > 0) {
-      backend_.append(currentPath_.c_str(), footer, static_cast<std::size_t>(used));
+      backend_.append(currentPath_.c_str(), footer, used);
     }
   }
 
@@ -570,6 +645,7 @@ void LogStore::describeSegment(JsonObjectConst entry, SegmentInfo& out) {
 
 std::size_t LogStore::listSegments(const char* id, SegmentInfo* out,
                                    std::size_t capacity) const {
+  const LockGuard held(mutex_);
   JsonDocument index;
   if (!loadIndex(index).ok()) return 0;
   std::size_t count = 0;
@@ -586,6 +662,7 @@ std::size_t LogStore::listSegments(const char* id, SegmentInfo* out,
 
 bool LogStore::segmentInfo(const char* id, std::uint32_t sequence,
                            SegmentInfo& out) const {
+  const LockGuard held(mutex_);
   JsonDocument index;
   if (!loadIndex(index).ok()) return false;
   for (JsonObjectConst entry : index["logs"].as<JsonArrayConst>()) {
@@ -607,7 +684,10 @@ Status LogStore::acknowledgeSegment(const char* id, std::uint32_t sequence,
                                     const char* collectorId, std::size_t bytes,
                                     std::uint32_t payloadCrc32,
                                     bool& alreadyAcknowledged) {
+  const LockGuard held(mutex_);
   alreadyAcknowledged = false;
+  LC_MEM_REPORT("before segment ack");
+  LC_MEM_CHECK("before segment ack");
 
   JsonDocument index;
   const Status loaded = loadIndex(index);
@@ -654,6 +734,8 @@ Status LogStore::acknowledgeSegment(const char* id, std::uint32_t sequence,
       const char* path = item["path"] | "";
       if (path[0] != '\0') backend_.remove(path);
       pending.remove(i);
+      LC_MEM_REPORT("after segment ack");
+      LC_MEM_CHECK("after segment ack");
       entry["segments_acked"] = (entry["segments_acked"] | 0u) + 1u;
       // Monotonic and contiguous: what makes a repeat answerable without
       // keeping every number ever acknowledged.
@@ -696,6 +778,7 @@ Status LogStore::acknowledgeSegment(const char* id, std::uint32_t sequence,
  */
 std::size_t LogStore::listOrphans(FixedString<64>* out,
                                   std::size_t capacity) const {
+  const LockGuard held(mutex_);
   JsonDocument index;
   if (!loadIndex(index).ok()) return 0;
 
@@ -768,14 +851,14 @@ Status LogStore::recoverSessions() {
       const char* path = active["path"] | "";
       if (path[0] != '\0' && backend_.exists(path)) {
         char footer[192];
-        const int used = std::snprintf(
-            footer, sizeof(footer),
-            "# segment_complete\n# segment_rows: %u\n"
-            "# RECOVERED_TRUNCATED: power was lost while this part was open;"
-            " its checksum is unknown\n",
-            static_cast<unsigned>(active["rows"] | 0u));
+        std::size_t used = 0;
+        appendFormat(footer, sizeof(footer), used,
+                     "# segment_complete\n# segment_rows: %u\n"
+                     "# RECOVERED_TRUNCATED: power was lost while this part was"
+                     " open; its checksum is unknown\n",
+                     static_cast<unsigned>(active["rows"] | 0u));
         if (used > 0) {
-          backend_.append(path, footer, static_cast<std::size_t>(used));
+          backend_.append(path, footer, used);
         }
         const Result<std::size_t> size = backend_.size(path);
         if (pending.isNull()) pending = entry["pending"].to<JsonArray>();
@@ -807,6 +890,7 @@ Status LogStore::recoverSessions() {
 }
 
 bool LogStore::pathFor(const char* id, FixedString<64>& out) const {
+  const LockGuard held(mutex_);
   JsonDocument index;
   if (!loadIndex(index).ok()) return false;
   for (JsonObjectConst entry : index["logs"].as<JsonArrayConst>()) {
@@ -818,6 +902,7 @@ bool LogStore::pathFor(const char* id, FixedString<64>& out) const {
 }
 
 Status LogStore::removeSession(const char* id) {
+  const LockGuard held(mutex_);
   if (open_ && currentId_.equals(id)) {
     return fail(ErrorCode::kResourceBusy, "this dataset is being recorded");
   }

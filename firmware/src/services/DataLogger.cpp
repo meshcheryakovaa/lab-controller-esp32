@@ -4,6 +4,8 @@
 #include <cstdio>
 #include <cstring>
 
+#include "core/Format.h"
+
 namespace lc {
 namespace {
 
@@ -234,8 +236,13 @@ bool DataLogger::takeTruncationNotice() {
 //  Sampling
 // ---------------------------------------------------------------------------
 void DataLogger::appendRow(Micros now) {
-  char row[512];
   std::size_t used = 0;
+  // Every append is checked.  Before 0.15.1-m15 they were summed blind, and a
+  // single wide column — a saturated sensor printed as ",%.3f" of 3.4e38 is 44
+  // characters on its own — pushed the offset past the end of the buffer, after
+  // which the "remaining capacity" was an unsigned subtraction that had wrapped.
+  // See core/Format.h.
+  bool complete = true;
 
   // t_ms is measured from the start of the LOGICAL session and is not reset by
   // rotation: a segment boundary is a fact about files, not about the
@@ -243,13 +250,12 @@ void DataLogger::appendRow(Micros now) {
   const Micros elapsedMs = (now - status_.startedUs) / 1000ULL;
   const EpochMs epoch = clock_.epochMillis();
   const std::uint32_t globalRow = nextGlobalRow_;
-  used += static_cast<std::size_t>(std::snprintf(
-      row + used, sizeof(row) - used, "%llu,%llu",
-      static_cast<unsigned long long>(elapsedMs),
-      static_cast<unsigned long long>(epoch)));
+  complete &= appendFormat(row_, sizeof(row_), used, "%llu,%llu",
+                           static_cast<unsigned long long>(elapsedMs),
+                           static_cast<unsigned long long>(epoch));
   if (spec_.storageMode == LogStorageMode::kContinuousOffload) {
-    used += static_cast<std::size_t>(std::snprintf(
-        row + used, sizeof(row) - used, ",%u", static_cast<unsigned>(globalRow)));
+    complete &= appendFormat(row_, sizeof(row_), used, ",%u",
+                             static_cast<unsigned>(globalRow));
   }
 
   // One bit per channel: set when that channel's value was anything other than
@@ -257,33 +263,40 @@ void DataLogger::appendRow(Micros now) {
   // importantly, impossible to leave out of a row.
   std::uint32_t qualityMask = 0;
 
-  for (std::size_t i = 0; i < spec_.channelCount && used < sizeof(row) - 48; ++i) {
+  // Room kept back for the quality mask, which is not optional: a row that ran
+  // out of space before it would be missing its last column, and a CSV with a
+  // short row is a CSV that silently changes shape halfway down.
+  const std::size_t bodyCapacity = sizeof(row_) - kRowSuffixBytes;
+
+  for (std::size_t i = 0; i < spec_.channelCount; ++i) {
     const ChannelValue* value = channels_.value(spec_.channels[i]);
     const ChannelDescriptor* descriptor = channels_.descriptor(spec_.channels[i]);
-    const std::uint8_t precision = (descriptor != nullptr) ? descriptor->precision : 3;
+    std::uint8_t precision = (descriptor != nullptr) ? descriptor->precision : 3;
+    // Clamped, not trusted: precision arrives from a configuration file, and
+    // "%.*f" with a precision of 200 is a 240-character column.
+    if (precision > kMaxPrecision) precision = kMaxPrecision;
 
     if (value == nullptr) {
       // The channel disappeared mid-session (its device was removed).  The
       // column stays — a dataset whose column count changes halfway through is
       // not a dataset — and the quality bit says why it is empty.
       qualityMask |= (1u << i);
-      used += static_cast<std::size_t>(std::snprintf(
-          row + used, sizeof(row) - used, spec_.includeRaw ? ",," : ","));
+      complete &= appendFormat(row_, bodyCapacity, used,
+                               spec_.includeRaw ? ",," : ",");
       continue;
     }
     if (value->quality != ChannelQuality::kGood) qualityMask |= (1u << i);
 
     if (spec_.includeRaw) {
-      used += static_cast<std::size_t>(std::snprintf(
-          row + used, sizeof(row) - used, ",%.6g", static_cast<double>(value->raw)));
+      complete &= appendFormat(row_, bodyCapacity, used, ",%.6g",
+                               static_cast<double>(value->raw));
     }
-    used += static_cast<std::size_t>(std::snprintf(
-        row + used, sizeof(row) - used, ",%.*f", static_cast<int>(precision),
-        static_cast<double>(value->processed)));
+    complete &= appendFormat(row_, bodyCapacity, used, ",%.*f",
+                             static_cast<int>(precision),
+                             static_cast<double>(value->processed));
   }
 
-  used += static_cast<std::size_t>(std::snprintf(
-      row + used, sizeof(row) - used, ",%u\n", qualityMask));
+  complete &= appendFormat(row_, sizeof(row_), used, ",%u\n", qualityMask);
 
   // The number is consumed whether or not the row survives.  A dropped row that
   // renumbered the ones after it would close the gap in the CSV and make a loss
@@ -292,6 +305,16 @@ void DataLogger::appendRow(Micros now) {
   ++nextGlobalRow_;
   status_.nextGlobalRow = nextGlobalRow_;
 
+  if (!complete) {
+    // kRowBytes is derived from the same limits the logger enforces at start(),
+    // so this is unreachable by configuration.  If it ever fires, the row is
+    // malformed and is counted as lost rather than written: a truncated line in
+    // the middle of a dataset is worse than a visible gap, because the gap is
+    // the thing global_row and dropped_rows exist to make visible.
+    ++status_.droppedRows;
+    return;
+  }
+
   if (buffered_ + used > kBufferBytes) {
     // The medium is not keeping up.  Counted, reported in the footer and in the
     // index, and never quietly skipped.
@@ -299,7 +322,7 @@ void DataLogger::appendRow(Micros now) {
     return;
   }
   if (bufferedRows_ == 0) firstBufferedGlobalRow_ = globalRow;
-  std::memcpy(buffer_ + buffered_, row, used);
+  std::memcpy(buffer_ + buffered_, row_, used);
   buffered_ += used;
   ++bufferedRows_;
   lastBufferedGlobalRow_ = globalRow;

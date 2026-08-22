@@ -65,6 +65,14 @@ class PsychicHttpAdapter final : public IWebSocketSink {
   // Registers every route and starts the server.  MUST be called after the
   // network is up: PsychicHttpServer::start() refuses to run without a
   // connected interface, and it says so rather than crashing later.
+  //
+  // SAFE TO RETRY (0.15.1-m15).  Route registration happens once and the start
+  // is what repeats, so a caller may keep trying while the interface is still
+  // coming up.  The version before this one registered every route again on
+  // each attempt, which leaked a handler and a lambda per try and would
+  // eventually take the heap with it — so the only safe number of attempts was
+  // one, and one attempt is exactly what left the controller with no web
+  // interface after a reset.
   Status begin();
   void end();
   bool running() const { return started_; }
@@ -81,6 +89,11 @@ class PsychicHttpAdapter final : public IWebSocketSink {
                      const char* contentType, const char* cacheControl);
   esp_err_t sendShell(PsychicResponse* response);
   esp_err_t sendJson(PsychicResponse* response, int code, const char* json);
+  // Configuration and route registration: exactly once, however many times
+  // begin() is called.  Both must happen while the server is STOPPED — a
+  // WebSocket needs a real esp-idf URI handler, and those can only be added
+  // before start().
+  void configureAndRegisterOnce();
   void handleWebSocketFrame(PsychicWebSocketRequest* request, const char* text,
                             std::size_t length);
   void sendHello(PsychicWebSocketClient* client);
@@ -93,6 +106,7 @@ class PsychicHttpAdapter final : public IWebSocketSink {
   PsychicHttpServer server_{kPort};
   PsychicWebSocketHandler websocket_;
   bool started_ = false;
+  bool configured_ = false;
 };
 
 }  // namespace platform

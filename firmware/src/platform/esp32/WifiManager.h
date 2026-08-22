@@ -41,6 +41,37 @@ class WifiManager {
   bool connected() const;
   bool accessPointActive() const { return apActive_; }
 
+  /**
+   * Is there a network interface an HTTP server can actually bind to?
+   *
+   * 0.15.1-m15.  After a software reset the boot log said, in this order:
+   *
+   *     access point started (192.168.4.1)
+   *     [psychic] Server start failed - no network interface available
+   *
+   * which reads like a contradiction and is not one.  `WiFi.softAP()` returns as
+   * soon as it has ASKED esp-idf for an access point; the esp_netif behind it
+   * comes up asynchronously, a little later.  PsychicHttp checks for a handle
+   * that exists, is UP, and holds a non-zero address before it will start —
+   * quite rightly, since the alternative is binding to nothing — so the window
+   * between those two moments is a window in which the web server refuses to
+   * start and the controller is then unreachable until somebody power-cycles it.
+   *
+   * A cold boot usually gets through the window by accident, because so much
+   * else happens first.  SW_CPU_RESET does not: everything is already warm, and
+   * setup() reaches the HTTP server sooner.  That is why this only appeared
+   * after a crash — which made it look like part of the crash, and it is not.
+   *
+   * This asks the same three questions PsychicHttp asks, so waiting on it means
+   * waiting for the actual precondition rather than for a guessed number of
+   * milliseconds.
+   */
+  bool interfaceReady() const;
+
+  /** Blocks until interfaceReady(), or the timeout.  Start-up only: it is
+   *  called from setup(), before the scheduler owns the loop. */
+  bool waitUntilReady(std::uint32_t timeoutMs = 3000) const;
+
   // Called periodically: re-attempts the station connection while the AP is up,
   // so a rig that lost the lab network rejoins it on its own once it returns.
   void tick(std::uint32_t nowMs);

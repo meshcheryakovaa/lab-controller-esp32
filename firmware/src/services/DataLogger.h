@@ -197,6 +197,32 @@ class DataLogger {
   static constexpr std::size_t kBufferBytes = 4096;
   static constexpr float kMaxRateHz = 50.0f;
 
+  // --- how wide one row can be (0.15.1-m15) --------------------------------
+  //
+  // These were a guess — `char row[512]` — and the guess was wrong, which is
+  // how a 16-channel rig reading a saturated sensor overran its task's stack.
+  // They are now DERIVED, so the bound cannot drift away from the format that
+  // has to fit inside it.  If a column ever gains a field, this arithmetic is
+  // where it has to be paid for.
+
+  /** Decimals for the processed value.  A float carries about seven
+   *  significant digits; a column printed with more decimals than that is not
+   *  more precise, it is noise with a wider stack footprint.  Configurations
+   *  asking for more are clamped rather than refused. */
+  static constexpr std::uint8_t kMaxPrecision = 9;
+  /** ",%.6g" of a float: sign, digit, point, six digits, "e-38" → 13.  */
+  static constexpr std::size_t kRawColumnBytes = 24;
+  /** ",%.9f" of ±3.4e38: sign, 39 integer digits, point, 9 decimals → 51. */
+  static constexpr std::size_t kValueColumnBytes = 56;
+  /** "t_ms,epoch_ms" as two 64-bit values, plus M15's ",global_row". */
+  static constexpr std::size_t kRowPrefixBytes = 64;
+  /** ",4294967295\n" and the terminator. */
+  static constexpr std::size_t kRowSuffixBytes = 16;
+  static constexpr std::size_t kRowBytes =
+      kRowPrefixBytes +
+      limits::kMaxLoggedChannels * (kRawColumnBytes + kValueColumnBytes) +
+      kRowSuffixBytes + 1;
+
   DataLogger(const IClock& clock, ChannelManager& channels, Scheduler& scheduler,
              EventBus& events)
       : clock_(clock), channels_(channels), scheduler_(scheduler), events_(events) {}
@@ -243,6 +269,11 @@ class DataLogger {
   Micros lastRowUs_ = 0;
 
   char buffer_[kBufferBytes];
+  // One row under construction.  A MEMBER, not a local: the logger runs on the
+  // Arduino loop task alongside Wi-Fi and LittleFS, and 1.4 KB of row on that
+  // task's stack is 1.4 KB the deep call chains underneath do not have.  In
+  // .bss it costs the same RAM and cannot take the return address with it.
+  char row_[kRowBytes];
   std::size_t buffered_ = 0;
   bool truncationNotice_ = false;
 

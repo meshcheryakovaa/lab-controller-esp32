@@ -2,13 +2,33 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <esp_netif.h>
 
 namespace lc {
 namespace platform {
 namespace {
 constexpr std::uint32_t kRetryIntervalMs = 60000;
 constexpr const char* kNamespace = "lc-wifi";
+
+/**
+ * The three conditions PsychicHttp checks before it will start a server.
+ *
+ * Deliberately the same three, and in the same order: a readiness test that
+ * asked an easier question than the library would still let setup() start the
+ * server too early, which is the whole failure being fixed.
+ */
+bool netifReady(const char* key) {
+  esp_netif_t* netif = esp_netif_get_handle_from_ifkey(key);
+  if (netif == nullptr) return false;
+  if (!esp_netif_is_netif_up(netif)) return false;
+
+  esp_netif_ip_info_t info{};
+  if (esp_netif_get_ip_info(netif, &info) != ESP_OK) return false;
+  // A station that has associated but has no lease yet reports 0.0.0.0.
+  return info.ip.addr != 0;
 }
+
+}  // namespace
 
 // Every open is READ/WRITE, including the ones that only read.
 //
@@ -124,6 +144,39 @@ void WifiManager::tick(std::uint32_t nowMs) {
 }
 
 bool WifiManager::connected() const { return WiFi.status() == WL_CONNECTED; }
+
+bool WifiManager::interfaceReady() const {
+  const wifi_mode_t mode = WiFi.getMode();
+
+  // Either interface will do: the point is that SOMETHING is up with an
+  // address, because that is all the HTTP server needs to bind.
+  if ((mode == WIFI_MODE_AP || mode == WIFI_MODE_APSTA) &&
+      netifReady("WIFI_AP_DEF")) {
+    return true;
+  }
+  if ((mode == WIFI_MODE_STA || mode == WIFI_MODE_APSTA) &&
+      netifReady("WIFI_STA_DEF")) {
+    return true;
+  }
+  return false;
+}
+
+bool WifiManager::waitUntilReady(std::uint32_t timeoutMs) const {
+  const std::uint32_t startedMs = millis();
+  // Polling rather than an event handler: this runs in setup(), where blocking
+  // is what is wanted, and an interface that never comes up has to end in a
+  // timeout rather than a callback that is never delivered.
+  //
+  // A fixed delay() here instead of the check would be the tempting fix and the
+  // wrong one — it would work on the bench and fail on the boot where
+  // initialisation happened to take a little longer, which is precisely how
+  // this bug behaved in the first place.
+  while (millis() - startedMs < timeoutMs) {
+    if (interfaceReady()) return true;
+    delay(20);  // start-up only; the scheduler does not own the loop yet
+  }
+  return false;
+}
 
 }  // namespace platform
 }  // namespace lc

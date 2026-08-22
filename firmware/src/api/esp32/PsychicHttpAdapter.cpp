@@ -54,6 +54,26 @@ bool pathIsSafe(const String& path) {
 Status PsychicHttpAdapter::begin() {
   if (started_) return ok();
 
+  // Registration is idempotent; the START is what may be retried.  See the
+  // header: doing both on every attempt was what made retrying unsafe.
+  configureAndRegisterOnce();
+
+  const esp_err_t started = server_.begin();
+  if (started != ESP_OK) {
+    // Almost always "no network interface available": the caller got here
+    // before esp_netif finished coming up.  Nothing has leaked, so the caller
+    // may wait and call again.
+    return fail(ErrorCode::kInternal, "the web server did not start");
+  }
+
+  started_ = true;
+  return ok();
+}
+
+void PsychicHttpAdapter::configureAndRegisterOnce() {
+  if (configured_) return;
+  configured_ = true;
+
   // Sockets: four WebSocket clients plus a few HTTP keep-alives.  Anything the
   // server itself derives (max_uri_handlers) is set inside start() and must not
   // be second-guessed here.
@@ -143,16 +163,6 @@ Status PsychicHttpAdapter::begin() {
 
   // Anything else is a client-side route.
   server_.on("/*", HTTP_GET, shell);
-
-  const esp_err_t started = server_.begin();
-  if (started != ESP_OK) {
-    // The usual cause is calling this before the network is up; the library
-    // refuses rather than crashing inside lwIP, which is the better failure.
-    return fail(ErrorCode::kInternal, "the web server did not start");
-  }
-
-  started_ = true;
-  return ok();
 }
 
 void PsychicHttpAdapter::end() {

@@ -1021,8 +1021,83 @@ static void test_the_index_does_not_grow_with_the_length_of_the_run() {
   TEST_ASSERT_TRUE(finalSize < LogStore::kMaxIndexBytes);
 }
 
+// ---------------------------------------------------------------------------
+//  0.15.1-m15 — the header that did not fit
+//
+//  ensureSegmentHeader() summed snprintf return values, so a rig with a wide
+//  column line left `used` past the end of a 1024-byte stack buffer and then
+//  passed that number to append() as the length to write.  The dataset got
+//  several hundred bytes of whatever followed the buffer, and every byte count
+//  the store kept was wrong from then on.
+//
+//  The assertion is the one that cannot be satisfied by accident: what the store
+//  BELIEVES it wrote has to equal what is actually on the disk.
+// ---------------------------------------------------------------------------
+static void test_the_header_never_writes_more_than_it_holds() {
+  Rig rig;
+  TEST_ASSERT_TRUE(rig.logStore.begin().ok());
+
+  // A full rig: the most channels a dataset may have, each with the longest key
+  // and unit the types allow, and both columns per channel.
+  std::string names[limits::kMaxLoggedChannels * 2];
+  const char* columns[limits::kMaxLoggedChannels * 2];
+  for (std::size_t i = 0; i < limits::kMaxLoggedChannels * 2; ++i) {
+    names[i] = std::string(limits::kKeyLength - 1, 'k') + "." +
+               std::string(limits::kUnitLength - 1, 'u');
+    columns[i] = names[i].c_str();
+  }
+  // And a calibration list far longer than any header could name.
+  for (std::size_t i = 0; i < 40; ++i) {
+    ActiveCalibration record;
+    char key[limits::kKeyLength];
+    std::snprintf(key, sizeof(key), "channel_%02u", static_cast<unsigned>(i));
+    record.channel.assign(key);
+    record.id.assign("cal_0000000000000001");
+    rig.calibrations.setActive(record);
+  }
+
+  LogSpec spec = m15::continuousSpec(LogStore::kMinSegmentBytes);
+  spec.includeRaw = true;
+  spec.channelCount = limits::kMaxLoggedChannels;
+  KeyString id;
+  TEST_ASSERT_TRUE(
+      rig.logStore
+          .openSession(spec, columns, limits::kMaxLoggedChannels * 2, id).ok());
+
+  const std::string rows = m15::makeRows(1, 10);
+  TEST_ASSERT_TRUE(rig.logStore.appendRows(m15::batchOf(rows, 1, 10)).ok());
+  rig.logStore.closeSession(LogStatus{});
+
+  LogStore::SegmentInfo waiting[LogStore::kMaxPendingSegments];
+  const std::size_t count =
+      rig.logStore.listSegments(id.c_str(), waiting, LogStore::kMaxPendingSegments);
+  TEST_ASSERT_EQUAL_UINT(1, count);
+
+  const std::string file = m15::readFile(rig.backend, waiting[0].path.c_str());
+  // The accounting matches the disk.  This is what the old code could not do.
+  TEST_ASSERT_EQUAL_UINT(file.size(), waiting[0].bytes);
+
+  // The column line is COMPLETE — every column named, and the quality mask last.
+  // A truncated one would still parse, which is exactly why it has to be checked.
+  const std::size_t columnLine = file.find("t_ms,epoch_ms,global_row");
+  TEST_ASSERT_TRUE(columnLine != std::string::npos);
+  const std::size_t lineEnd = file.find('\n', columnLine);
+  const std::string line = file.substr(columnLine, lineEnd - columnLine);
+  std::size_t commas = 0;
+  for (const char c : line) if (c == ',') ++commas;
+  // t_ms | epoch_ms | global_row | 32 data columns | quality_mask
+  TEST_ASSERT_EQUAL_UINT(2 + 1 + limits::kMaxLoggedChannels * 2, commas);
+  TEST_ASSERT_TRUE(line.size() > 12 && line.rfind(",quality_mask") == line.size() - 13);
+
+  // The calibration list was cut on purpose and SAYS so, rather than reading as
+  // a complete list of what produced the units.
+  TEST_ASSERT_TRUE(file.find("# calibrations:") != std::string::npos);
+  TEST_ASSERT_TRUE(file.find(" more)") != std::string::npos);
+}
+
 int main(int, char**) {
   UNITY_BEGIN();
+  RUN_TEST(test_the_header_never_writes_more_than_it_holds);
   RUN_TEST(test_save_and_load_round_trip);
   RUN_TEST(test_missing_section_is_not_an_error_condition);
   RUN_TEST(test_first_boot_writes_empty_sections_once);

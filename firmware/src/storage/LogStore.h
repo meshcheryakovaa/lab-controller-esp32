@@ -33,6 +33,7 @@
 
 #include "core/Crc32.h"
 #include "core/Error.h"
+#include "core/Lock.h"
 #include "services/CalibrationManager.h"
 #include "services/DataLogger.h"
 #include "storage/ConfigStorage.h"
@@ -73,6 +74,26 @@ class LogStore final : public ILogSink {
   // How far back from the newest segment number listOrphans() looks.  See the
   // comment on that function: bounded on purpose.
   static constexpr std::uint32_t kOrphanProbeDepth = 32;
+
+  // --- how wide the header can be (0.15.1-m15) ------------------------------
+  //
+  // Derived from the limits, not guessed.  The column line was a 640-byte
+  // buffer that a 16-channel rig with raw columns overflowed silently, and the
+  // whole line was then appended into a 1024-byte header buffer that could not
+  // hold it either — after which `used` exceeded the buffer and the append that
+  // followed handed the filesystem a length longer than the array it read from.
+
+  /** ",<key>.<unit>" per column, both columns per channel, plus the fixed
+   *  "t_ms,epoch_ms", M15's ",global_row" and the trailing ",quality_mask". */
+  static constexpr std::size_t kColumnLineBytes =
+      16 + 16 +
+      limits::kMaxLoggedChannels * 2 *
+          (1 + limits::kKeyLength + limits::kUnitLength + 8) +
+      16;
+  /** The metadata block: everything above the column line.  The column line is
+   *  appended to the FILE separately and deliberately never travels through
+   *  this buffer — that is what made the old bound impossible to satisfy. */
+  static constexpr std::size_t kHeaderBytes = 1024;
 
   /** What a waiting segment looks like to the API and to the collector. */
   struct SegmentInfo {
@@ -166,6 +187,15 @@ class LogStore final : public ILogSink {
   ConfigStorage& storage_;
   CalibrationManager* calibrations_ = nullptr;
 
+  // Serialises the store against itself.  The logger's flush runs on the loop
+  // task and the offload routes run on the HTTP server's task, and both
+  // read-modify-write /data/logs.json.  See core/Lock.h for what that costs
+  // when it is not serialised.  `mutable` because the const query methods —
+  // listSegments, segmentInfo, pathFor — read the same file the writers are
+  // rewriting, and a torn read there is a segment described wrongly to a
+  // collector that is about to ask for it to be deleted.
+  mutable RecursiveMutex mutex_;
+
   FixedString<64> currentPath_;
   KeyString currentId_;
   bool open_ = false;
@@ -185,7 +215,8 @@ class LogStore final : public ILogSink {
   // The header is rewritten for every segment, so what it is built from has to
   // outlive the call that started the session.
   LogSpec spec_;
-  char columnLine_[640] = {0};
+  char columnLine_[kColumnLineBytes] = {0};
+  std::size_t columnLineLength_ = 0;
   // Writing the active size into the index on every flush would be a flash
   // write every half second for the length of the run (§22).  Throttled by
   // BYTES rather than by time so that no clock is needed here and the cost is

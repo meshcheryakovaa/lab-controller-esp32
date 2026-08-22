@@ -140,6 +140,32 @@ RestApi g_api(makeApiServices());
 platform::PsychicHttpAdapter g_http(g_api, g_telemetry, g_storage,
                                     g_metrics.controllerId());
 
+// How often loop() re-attempts a web server that has not started yet.
+constexpr std::uint32_t kHttpRetryMs = 500;
+std::uint32_t g_lastHttpAttemptMs = 0;
+
+// Starting the web server, reported once.  Kept out of setup() because loop()
+// retries it: a controller that came up with no web interface is a controller
+// somebody has to walk over to and power-cycle, which is the outcome this whole
+// fix exists to prevent.
+bool g_httpFailureReported = false;
+
+bool startHttp() {
+  const lc::Status http = g_http.begin();
+  if (http.ok()) {
+    Serial.println("http: listening on port 80");
+    return true;
+  }
+  // Reported once.  The retry below runs twice a second, and a console that
+  // repeats the same line forever is a console nobody reads the useful lines in.
+  if (!g_httpFailureReported) {
+    g_httpFailureReported = true;
+    Serial.printf("http: %s (%s) — will keep retrying\n", http.symbol(),
+                  http.detail.c_str());
+  }
+  return false;
+}
+
 // Until the web UI exists (Milestone 4), the serial console is the only place
 // events can be observed.  It is a subscriber like any other, not a special case.
 void logEvent(const Event& event, void*) {
@@ -221,9 +247,21 @@ void setup() {
   Serial.printf("  network:    %s at %s\n", g_metrics.networkMode(),
                 g_metrics.ipAddress());
 
-  const lc::Status http = g_http.begin();
-  if (!http.ok()) {
-    Serial.printf("http: %s (%s)\n", http.symbol(), http.detail.c_str());
+  // The web server is started only once esp_netif is actually up and holds an
+  // address.  softAP() returning success means the request was accepted, not
+  // that the interface exists yet, and PsychicHttp refuses to bind to an
+  // interface that is not there — so starting it straight after g_wifi.begin()
+  // is a race.  A cold boot usually won it; a software reset, where everything
+  // is already warm and setup() gets here sooner, usually lost it, and the
+  // controller came back up with no web interface at all (0.15.1-m15).
+  if (!network.ok()) {
+    Serial.println("http: skipped because the network did not start");
+  } else if (!g_wifi.waitUntilReady()) {
+    Serial.println("http: the network interface did not come up in time;"
+                   " retrying in the background");
+  } else {
+    Serial.println("  network:    interface ready");
+    startHttp();
   }
 
   const lc::Status telemetry =
@@ -236,7 +274,18 @@ void setup() {
 
 void loop() {
   g_system.loop();
-  g_wifi.tick(millis());
+  const std::uint32_t nowMs = millis();
+  g_wifi.tick(nowMs);
+
+  // If the interface was not ready in setup(), keep trying.  begin() registers
+  // its routes once and retries only the start, so this costs nothing but a
+  // check twice a second and cannot leak handlers.  Without it, an interface
+  // that took longer than the start-up wait would leave the instrument
+  // unreachable until somebody power-cycled it.
+  if (!g_http.running() && nowMs - g_lastHttpAttemptMs >= kHttpRetryMs) {
+    g_lastHttpAttemptMs = nowMs;
+    if (g_wifi.interfaceReady()) startHttp();
+  }
 
   // Yield to the Wi-Fi/IDF tasks instead of spinning.  Sleeping until just
   // before the next deadline keeps jitter low without burning the core.

@@ -7,6 +7,7 @@
 #include <cstring>
 
 #include "core/Crc32.h"
+#include "core/Format.h"
 
 #include <cstdio>
 #include <cstring>
@@ -475,8 +476,147 @@ static void test_crc32_matches_the_vectors_the_browser_uses() {
   TEST_ASSERT_TRUE(peek != partial.value());
 }
 
+// ---------------------------------------------------------------------------
+//  0.15.1-m15 — bounded formatting.
+//
+//  `used += snprintf(buffer + used, sizeof(buffer) - used, ...)` is the line
+//  that rebooted the controller.  snprintf reports what it WANTED to write, so
+//  one truncation puts `used` past the end and the next call is handed a
+//  wrapped-around capacity of about four billion bytes.
+// ---------------------------------------------------------------------------
+static void test_append_format_never_walks_past_the_end() {
+  char buffer[16];
+  std::size_t used = 0;
+
+  TEST_ASSERT_TRUE(appendFormat(buffer, sizeof(buffer), used, "12345"));
+  TEST_ASSERT_EQUAL_UINT(5, used);
+
+  // Does not fit: reported, and `used` stops AT the terminator rather than
+  // sailing past it.  This is the assertion the old code could not make.
+  TEST_ASSERT_FALSE(appendFormat(buffer, sizeof(buffer), used,
+                                 "abcdefghijklmnopqrstuvwxyz"));
+  TEST_ASSERT_TRUE(used < sizeof(buffer));
+  TEST_ASSERT_EQUAL_UINT(sizeof(buffer) - 1, used);
+  // What survived is a valid string of exactly `used` characters, so a caller
+  // that writes `used` bytes to a file writes only bytes it owns.
+  TEST_ASSERT_EQUAL_UINT(used, std::strlen(buffer));
+
+  // A further append on a full buffer is refused rather than compounding.
+  TEST_ASSERT_FALSE(appendFormat(buffer, sizeof(buffer), used, "!"));
+  TEST_ASSERT_EQUAL_UINT(sizeof(buffer) - 1, used);
+  TEST_ASSERT_EQUAL_UINT(used, std::strlen(buffer));
+
+  // Exactly filling the buffer is success, not truncation.
+  char exact[6];
+  std::size_t fits = 0;
+  TEST_ASSERT_TRUE(appendFormat(exact, sizeof(exact), fits, "%s", "abcde"));
+  TEST_ASSERT_EQUAL_UINT(5, fits);
+  TEST_ASSERT_EQUAL_STRING("abcde", exact);
+}
+
+namespace {
+
+/** Keeps the rows the logger produces so a test can read them. */
+class CapturingSink final : public ILogSink {
+ public:
+  Status openSession(const LogSpec&, const char* const*, std::size_t,
+                     KeyString& id) override {
+    id.assign("log_0001");
+    return ok();
+  }
+  Status appendRows(const LogBatch& batch) override {
+    text.append(batch.text, batch.bytes);
+    return ok();
+  }
+  void closeSession(const LogStatus&) override {}
+  std::size_t writableBytes() const override { return 8u * 1024u * 1024u; }
+
+  std::string text;
+};
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
+//  The row that smashed the stack.
+//
+//  A full rig, a saturated sensor and a configuration asking for more decimals
+//  than a float has: ",%.*f" of 3.4e38 is over forty characters on its own, and
+//  sixteen channels of it went straight past `char row[512]` — first past the
+//  loop's own guard, then into the return address of the task that ran it.
+// ---------------------------------------------------------------------------
+static void test_a_wide_row_of_saturated_values_stays_inside_its_buffer() {
+  ManualClock clock;
+  ChannelManager channels(clock);
+  Scheduler scheduler(clock);
+  EventBus events;
+  DataLogger logger(clock, channels, scheduler, events);
+  CapturingSink sink;
+  logger.setSink(&sink);
+
+  LogSpec spec;
+  spec.name.assign("saturated");
+  spec.rateHz = 1.0f;
+  spec.includeRaw = true;
+  spec.storageMode = LogStorageMode::kContinuousOffload;
+  spec.collectorId.assign("browser-01");
+
+  for (std::size_t i = 0; i < limits::kMaxLoggedChannels; ++i) {
+    ChannelDescriptor descriptor;
+    char key[limits::kKeyLength];
+    std::snprintf(key, sizeof(key), "channel_%02u", static_cast<unsigned>(i));
+    descriptor.key.assign(key);
+    descriptor.unit.assign("units");
+    // Far more decimals than a float carries.  It arrives from a configuration
+    // file, so the logger has to survive it rather than trust it.
+    descriptor.precision = 200;
+    descriptor.minimum = -1e38f;
+    descriptor.maximum = 1e38f;
+    const Result<ChannelHandle> handle = channels.create(descriptor);
+    TEST_ASSERT_TRUE(handle.ok());
+    spec.channels[i] = handle.value();
+    // The widest number a float can be, in both columns.
+    channels.publishRaw(handle.value(), 3.4028235e38f, 1000);
+  }
+  spec.channelCount = limits::kMaxLoggedChannels;
+
+  TEST_ASSERT_TRUE(logger.start(spec).ok());
+  for (int i = 0; i < 8; ++i) {
+    clock.advanceMicros(1000000);
+    logger.sampleTick(clock.nowMicros());
+    // Flushed every tick, the way the scheduler does it.  These rows are about
+    // 1.1 KB each, so three of them fill the 4 KiB staging buffer — leaving them
+    // to pile up would measure the buffer, not the formatting.
+    logger.flushTick();
+  }
+
+  // Every row arrived — none was dropped as unformattable, which is what would
+  // happen if kRowBytes were still a guess rather than derived from the limits.
+  TEST_ASSERT_EQUAL_UINT(0, logger.status().droppedRows);
+  TEST_ASSERT_EQUAL_UINT(8, logger.status().rows);
+
+  // And every row is WELL FORMED: the right number of columns, ending in the
+  // quality mask.  A row cut short by a full buffer would still look like data.
+  std::size_t rows = 0;
+  std::size_t start = 0;
+  while (start < sink.text.size()) {
+    const std::size_t end = sink.text.find('\n', start);
+    TEST_ASSERT_TRUE(end != std::string::npos);
+    const std::string row = sink.text.substr(start, end - start);
+    std::size_t commas = 0;
+    for (const char c : row) if (c == ',') ++commas;
+    // t_ms | epoch_ms | global_row | 16 channels x (raw, value) | quality_mask
+    TEST_ASSERT_EQUAL_UINT(2 + 1 + limits::kMaxLoggedChannels * 2, commas);
+    TEST_ASSERT_TRUE(row.size() < DataLogger::kRowBytes);
+    ++rows;
+    start = end + 1;
+  }
+  TEST_ASSERT_EQUAL_UINT(8, rows);
+}
+
 int main(int, char**) {
   UNITY_BEGIN();
+  RUN_TEST(test_append_format_never_walks_past_the_end);
+  RUN_TEST(test_a_wide_row_of_saturated_values_stays_inside_its_buffer);
   RUN_TEST(test_the_static_footprint_stays_within_budget);
   RUN_TEST(test_sha256_matches_the_published_vectors);
   RUN_TEST(test_the_same_password_with_a_different_salt_is_a_different_hash);
