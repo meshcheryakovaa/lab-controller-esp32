@@ -7,13 +7,17 @@
 //    * VALUES arrive only over the WebSocket, addressed by handle, and never
 //      touch REST.  A dashboard open for eight hours makes zero HTTP requests.
 //
-//  History for charts lives here as a fixed-size ring per channel: the browser
-//  is the only place with room for it, and re-requesting it from a 240 MHz MCU
-//  every time a chart mounts would be absurd.
+//  History for charts lives here as a fixed-size ring per channel (see
+//  chart-history.ts): the browser is the only place with room for it, and
+//  re-requesting it from a 240 MHz MCU every time a chart mounts would be
+//  absurd.  Bounded is the operative word — a dashboard left open for a week
+//  must cost the same memory as one opened a minute ago.
 // =============================================================================
 
 import { api, ApiRequestError, type GpioMap } from './api';
+import { ChannelHistory, chartData, type AlignedHistory, type ChartRange } from './chart-history';
 import { kUnknownRevision, live } from './live';
+import { recorder } from './client-recorder.svelte';
 import type {
   AuthStatus, Calibration, Channel, ChannelQuality, ControlDocument, Device,
   LoggingStatus, ModuleManifest, RunStatus,
@@ -25,22 +29,6 @@ export interface Alert {
   code: string;
   message: string;
   at: number;
-}
-
-const HISTORY_POINTS = 900; // 3 minutes at 5 Hz — enough to see a transient
-
-class ChannelHistory {
-  readonly time: number[] = [];
-  readonly value: number[] = [];
-
-  push(t: number, v: number): void {
-    this.time.push(t);
-    this.value.push(v);
-    if (this.time.length > HISTORY_POINTS) {
-      this.time.shift();
-      this.value.shift();
-    }
-  }
 }
 
 export class ControllerState {
@@ -108,6 +96,35 @@ export class ControllerState {
       this.history.set(handle, entry);
     }
     return entry;
+  }
+
+  /**
+   * The history of a handle WITHOUT creating one.  A chart asks about channels
+   * that may have been deleted, and each empty history it created would be a
+   * pre-allocated ring for a channel that will never produce a sample.
+   */
+  peekHistory(handle: number): ChannelHistory | undefined {
+    return this.history.get(handle);
+  }
+
+  /**
+   * How much history these channels have taken in, as one number.  A chart
+   * redraws when this moves and skips the redraw when it does not — which is
+   * the difference between a page that idles at zero CPU and one that rebuilt
+   * every series four times a second for eight hours to draw the same picture.
+   */
+  historyRevision(handles: number[]): number {
+    let total = 0;
+    for (const handle of handles) total += this.peekHistory(handle)?.revision ?? 0;
+    return total;
+  }
+
+  /**
+   * Everything a chart needs, already bounded: the selected range, aligned onto
+   * one timebase and thinned to the widget's width.
+   */
+  chartData(handles: number[], range: ChartRange, width: number): AlignedHistory {
+    return chartData(handles.map((handle) => this.peekHistory(handle)), range, width);
   }
 
   /**
@@ -204,6 +221,7 @@ export class ControllerState {
         this.historyFor(channel.handle).push(channel.value.t, channel.value.processed);
       }
       this.configRevision = Number(system.config_revision ?? -1);
+      void recorder.attach(this.controllerId);
       this.subscribeToVisibleChannels();
     } catch (error) {
       this.loadError = describe(error);
@@ -377,9 +395,29 @@ export class ControllerState {
     }
   }
 
-  /** Ask the firmware for exactly the channels we can display, and no others. */
+  /**
+   * Which controller this is (M14).  REST first because it is available before
+   * the socket opens; the socket's `hello` confirms it.  Never the address: in
+   * access-point mode every board is 192.168.4.1, and local recordings filed
+   * under an address would merge two different rigs without a word.
+   */
+  get controllerId(): string {
+    const fromSystem = this.system?.controller_id;
+    if (typeof fromSystem === 'string' && fromSystem) return fromSystem;
+    return live.controllerId;
+  }
+
+  /**
+   * Ask the firmware for exactly the channels we can display — plus the ones a
+   * local recording needs.  A recording does not stop because the operator
+   * walked to the Hardware page, so its channels stay subscribed even when no
+   * widget on screen wants them (§5).
+   */
   subscribeToVisibleChannels(): void {
-    live.subscribe(this.channels.filter((c) => c.visible).map((c) => c.handle));
+    const wanted = new Set(
+      this.channels.filter((c) => c.visible).map((c) => c.handle));
+    for (const handle of recorder.subscribedHandles) wanted.add(handle);
+    live.subscribe([...wanted]);
   }
 
   // --- wiring --------------------------------------------------------------
@@ -387,6 +425,10 @@ export class ControllerState {
     const offStatus = live.onStatus((state) => {
       this.connected = state;
       if (state) this.subscribeToVisibleChannels();
+      // A local recording must show the outage rather than bridge it.  Told
+      // here, from the one place that knows, so the gap in the archive lines up
+      // with the gap the operator saw on screen.
+      void recorder.onConnectionChanged(state);
     });
 
     const offFrame = live.onFrame((frame) => {
@@ -398,6 +440,10 @@ export class ControllerState {
       for (const [handle, q] of frame.quality) {
         this.quality[handle] = q;
       }
+      // The SAME frame the chart drew.  A recorder that opened its own socket
+      // would cost the ESP32 a second client and could disagree with the
+      // screen about what arrived (§18).
+      recorder.onFrame(frame);
     });
 
     const offDevice = live.onDevice((handle, state, code) => {
@@ -422,6 +468,9 @@ export class ControllerState {
       if (revision === kUnknownRevision || revision !== this.configRevision) {
         void this.refresh();
       }
+      // A recording that spans a configuration change must say so: the channel
+      // it was recording may not mean the same thing afterwards.
+      void recorder.onConfigChanged(revision);
     });
 
     const offAlert = live.onAlert((severity, code, message) => {

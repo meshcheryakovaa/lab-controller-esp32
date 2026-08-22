@@ -257,6 +257,12 @@ void RestApi::handleSystem(const ApiRequest& request, const PathSegments& path,
 
   JsonObject out = response.body.to<JsonObject>();
   out["firmware"] = LC_FIRMWARE_VERSION;
+  // Which controller this is, independent of how it is reached.  Outside the
+  // `metrics != nullptr` block below on purpose: a client that files local
+  // recordings by controller must never be handed nothing and fall back to the
+  // address, because in access-point mode every board is 192.168.4.1 (§M14).
+  out["controller_id"] =
+      (s_.metrics != nullptr) ? s_.metrics->controllerId() : "lc-000000000000";
   out["chip"] = s_.resources->chip().name;
   out["schema_version"] = ConfigStorage::kSchemaVersion;
   out["config_revision"] = s_.storage->revision();

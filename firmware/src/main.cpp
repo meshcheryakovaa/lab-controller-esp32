@@ -137,7 +137,8 @@ RestApi::Services makeApiServices() {
 }
 
 RestApi g_api(makeApiServices());
-platform::PsychicHttpAdapter g_http(g_api, g_telemetry, g_storage);
+platform::PsychicHttpAdapter g_http(g_api, g_telemetry, g_storage,
+                                    g_metrics.controllerId());
 
 // Until the web UI exists (Milestone 4), the serial console is the only place
 // events can be observed.  It is a subscriber like any other, not a special case.

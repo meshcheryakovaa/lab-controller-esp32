@@ -35,11 +35,25 @@ class ISystemMetrics {
   virtual const char* ipAddress() const = 0;
   virtual const char* hostname() const = 0;
   virtual std::int32_t wifiRssi() const = 0;     // dBm, 0 when not connected
+
+  /**
+   * A name for THIS controller that survives a reflash and does not depend on
+   * the network (§M14).
+   *
+   * The IP address cannot serve: every board in access-point mode answers on
+   * 192.168.4.1, so a browser keeping data per origin would pour two different
+   * rigs into one archive and never notice.  This comes from the eFuse MAC,
+   * contains no secret, and is the key local recordings are filed under.
+   */
+  virtual const char* controllerId() const = 0;
 };
 
 // Reports zeroes and "OFF".  Used by the host tests, and as a safe default
 // before the network layer exists.
-class NullSystemMetrics final : public ISystemMetrics {
+//
+// Not `final`: tools/host_server derives from it to give each simulated rig its
+// own controllerId, and overriding one stub beats restating seven.
+class NullSystemMetrics : public ISystemMetrics {
  public:
   HeapMetrics heap() const override { return HeapMetrics{}; }
   std::uint32_t filesystemUsedBytes() const override { return 0; }
@@ -50,6 +64,10 @@ class NullSystemMetrics final : public ISystemMetrics {
   const char* ipAddress() const override { return "0.0.0.0"; }
   const char* hostname() const override { return "lab-controller"; }
   std::int32_t wifiRssi() const override { return 0; }
+  // Deliberately a constant, and deliberately not blank: a client filing data
+  // under "" would merge every host build ever run.  Tools that host several
+  // simulated rigs override this.
+  const char* controllerId() const override { return "lc-000000000000"; }
 };
 
 }  // namespace lc

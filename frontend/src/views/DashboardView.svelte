@@ -17,12 +17,24 @@
   import { dashboards } from '../lib/dashboards.svelte';
   import { findSlot } from '../lib/layout';
   import { controller } from '../lib/state.svelte';
+  import { recorder } from '../lib/client-recorder.svelte';
+  import LocalRecordingDialog from '../components/LocalRecordingDialog.svelte';
   import { WIDGET_TYPES, widgetChannels, widgetType } from '../lib/widgets';
   import type { Widget } from '../lib/widgets';
 
   let editing = $state(false);
   let selectedId = $state('');
   let narrow = $state(false);
+  let recordingDialog = $state(false);
+
+  /**
+   * Every channel this dashboard refers to, de-duplicated.  Seeds the recording
+   * dialog: the operator asked to record "what I am looking at", and making
+   * them re-pick it from a list of forty is how a channel gets left out.
+   */
+  const dashboardChannels = $derived([...new Set(
+    (dashboards.current?.widgets ?? []).flatMap((widget) => widgetChannels(widget)),
+  )]);
   let renaming = $state(false);
   let draftName = $state('');
 
@@ -199,6 +211,21 @@
         <button type="button" class="danger" onclick={removeDashboard}>Delete</button>
         <button type="button" class="primary" onclick={leaveEditing}>Done</button>
       {:else}
+        <!-- M14: recording onto THIS device.  Next to Edit layout because it is
+             a thing done to the view, not to the instrument — it changes no
+             configuration and asks the controller for nothing. -->
+        {#if !recorder.status.active}
+          <button type="button" onclick={() => (recordingDialog = true)}
+                  disabled={!recorder.status.available}
+                  title={recorder.status.available
+                    ? 'Record the channels on this dashboard onto this computer or tablet'
+                    : recorder.status.unavailableReason}>
+            Record on this device
+          </button>
+        {:else}
+          <button type="button" class="danger"
+                  onclick={() => void recorder.stop()}>Stop recording</button>
+        {/if}
         <button type="button" onclick={() => (editing = true)} disabled={narrow}
                 title={narrow ? 'Editing needs a wider screen' : 'Rearrange this dashboard'}>
           Edit layout
@@ -284,6 +311,12 @@
           onclose={() => (selectedId = '')} />
       {/if}
     </div>
+  {/if}
+
+  {#if recordingDialog}
+    <LocalRecordingDialog dashboardKey={dashboards.currentKey}
+                          suggested={dashboardChannels}
+                          onclose={() => (recordingDialog = false)} />
   {/if}
 </div>
 

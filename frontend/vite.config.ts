@@ -8,6 +8,17 @@ import { svelte } from '@sveltejs/vite-plugin-svelte';
 // firmware/data/www and the firmware serves the .gz files directly.
 export default defineConfig({
   plugins: [svelte()],
+  // The Milestone 14 export/decimation worker follows the same rule as the app
+  // bundle: one predictable name, no hash churn in the LittleFS image.
+  worker: {
+    format: 'es',
+    rollupOptions: {
+      output: {
+        entryFileNames: 'assets/[name].js',
+        chunkFileNames: 'assets/[name].js',
+      },
+    },
+  },
   build: {
     target: 'es2020',
     cssCodeSplit: false,

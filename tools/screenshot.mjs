@@ -10,7 +10,7 @@
 //  Usage:  node tools/screenshot.mjs [baseUrl] [outputDir]
 // =============================================================================
 import { chromium, request } from 'playwright';
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, readFileSync } from 'node:fs';
 
 const base = process.argv[2] ?? 'http://127.0.0.1:8080';
 const out = process.argv[3] ?? '/home/claude/shots';
@@ -627,6 +627,276 @@ await page.waitForTimeout(400);
 await page.getByRole('button', { name: 'Done' }).click();
 await page.waitForTimeout(1000);
 await shot('40-dashboard-with-run');
+
+// --- Milestone 13: a chart that can be asked for a different span ----------
+// The bug this closes is invisible in a screenshot: a dashboard left open all
+// day used to slow to a crawl, and the operator read that as a hung controller.
+// What IS checkable from here is the control that replaced the unusable window
+// setting — three buttons, one of them active, and a stored default that comes
+// back after a reload.
+await page.getByRole('button', { name: 'Edit layout' }).click();
+await page.getByRole('button', { name: 'Chart', exact: true }).click();
+await page.waitForTimeout(400);
+
+const kChartTitle = 'Range test';
+await page.locator('.panel input[type=text]').first().fill(kChartTitle);
+// Plot the bath: a chart with no channels shows a prompt, not a range bar.
+const seriesPick = page.locator('.panel .row select');
+const bathIndex = await seriesPick.evaluate((el) =>
+  Array.from(el.options).findIndex((o) => o.textContent.includes('Bath temperature')));
+if (bathIndex < 0) throw new Error('the bath channel is not offered to the chart');
+await seriesPick.selectOption({ index: bathIndex });
+await page.getByRole('button', { name: 'Add', exact: true }).click();
+await page.waitForTimeout(300);
+
+// The stored default is a choice of three now, not a free number the browser
+// could not honour.
+const rangePick = page.locator('.panel label.field select');
+const offered = await rangePick.evaluate((el) => Array.from(el.options).map((o) => o.value));
+if (JSON.stringify(offered) !== JSON.stringify(['0', '300', '600'])) {
+  throw new Error(`the chart offers ranges it cannot draw: ${offered.join(', ')}`);
+}
+await rangePick.selectOption('600');
+// The layout is written 2 s after the last change; wait for the claim, not for
+// a stopwatch.  The indicator only exists while editing, so this is the moment.
+await page.waitForFunction(
+  () => document.querySelector('.state')?.textContent?.trim() === 'saved',
+  { timeout: 15000 });
+await page.getByRole('button', { name: 'Done' }).click();
+await page.waitForTimeout(600);
+
+const chartTile = page.locator('.surface .cell').filter({ hasText: kChartTitle });
+const rangeButtons = chartTile.locator('.ranges button');
+if (await rangeButtons.count() !== 3) {
+  throw new Error(`a chart must offer three ranges, found ${await rangeButtons.count()}`);
+}
+const pressed = async () => {
+  const active = await chartTile.locator('.ranges button[aria-pressed=true]').all();
+  if (active.length !== 1) throw new Error(`${active.length} ranges are active at once`);
+  return (await active[0].textContent()).trim();
+};
+// The stored window_s decides where the buttons start.
+if (await pressed() !== '10 min') {
+  throw new Error(`a stored window of 600 s must select 10 min, not ${await pressed()}`);
+}
+await shot('50-chart-ranges');
+
+// Scoped to THIS tile: the seeded dashboard already carries a chart of its own,
+// and a range bar found anywhere on the page would answer for the wrong one.
+for (const label of ['5 min', 'All', '10 min']) {
+  const at = Date.now();
+  await chartTile.getByRole('button', { name: label, exact: true }).click();
+  await page.waitForFunction(
+    ({ want, title }) => {
+      const tile = [...document.querySelectorAll('.surface .cell')]
+        .find((cell) => cell.textContent.includes(title));
+      return tile?.querySelector('.ranges button[aria-pressed=true]')
+                 ?.textContent.trim() === want;
+    },
+    { want: label, title: kChartTitle }, { timeout: 2000 });
+  const took = Date.now() - at;
+  if (took > 1000) throw new Error(`switching to ${label} took ${took} ms`);
+  console.log(`  range ${label} in ${took} ms`);
+}
+await chartTile.getByRole('button', { name: '5 min', exact: true }).click();
+await page.waitForTimeout(400);
+await shot('51-chart-last-5-minutes');
+
+// And it has to have DRAWN something.  Every check above passes on a chart that
+// renders three perfect buttons over an empty canvas — which is exactly what a
+// wrongly shaped data array produces, silently, with no error anywhere.
+const inked = await chartTile.locator('canvas').first().evaluate((canvas) => {
+  const pixels = canvas.getContext('2d')
+    .getImageData(0, 0, canvas.width, canvas.height).data;
+  let n = 0;
+  for (let i = 3; i < pixels.length; i += 4) if (pixels[i] > 0) ++n;
+  return n;
+});
+if (inked < 1000) throw new Error(`the chart drew nothing: ${inked} painted pixels`);
+console.log(`  the chart drew ${inked} pixels`);
+
+// Pressing a button is a way of looking, not a change to the instrument.  Ask
+// the firmware rather than the browser: three range changes must have written
+// nothing, and the stored default must still be the ten minutes the editor
+// chose.  A dashboard that rewrote flash every time somebody glanced at the
+// last five minutes would wear the partition out for nothing.
+const boardApi = await request.newContext({ baseURL: base });
+const savedBoards = await (await boardApi.get('/api/v1/dashboards')).json();
+let storedWindow;
+for (const board of savedBoards.dashboards ?? []) {
+  const document_ = await (await boardApi.get(
+    `/api/v1/dashboards/${encodeURIComponent(board.key)}`)).json();
+  for (const widget of document_.widgets ?? []) {
+    if (widget.config?.title === kChartTitle) storedWindow = widget.config.window_s;
+  }
+}
+await boardApi.dispose();
+if (storedWindow !== 600) {
+  throw new Error(`looking at a range changed what was stored: window_s=${storedWindow}`);
+}
+await page.reload({ waitUntil: 'networkidle' });
+await page.waitForSelector('.surface .cell');
+await page.waitForTimeout(900);
+const restored = await page.locator('.surface .cell').filter({ hasText: kChartTitle })
+  .locator('.ranges button[aria-pressed=true]').textContent();
+if (restored.trim() !== '10 min') {
+  throw new Error(`the stored range did not survive a reload: ${restored.trim()}`);
+}
+console.log('  the stored chart range survived the reload');
+await shot('52-chart-range-after-reload');
+
+// --- Milestone 14: recording onto this device -----------------------------
+// The acceptance criteria are mostly about honesty under failure, so this
+// scenario deliberately breaks the link in the middle: what must appear
+// afterwards is a GAP, not a smooth line and a row count that pretends the
+// outage never happened.
+// The outage below has to be a REAL one: `setOffline` blocks new requests but
+// leaves an established WebSocket alone, so it proved nothing.  Routing the
+// socket gives the script a handle it can actually close, which is what the
+// browser sees when a tablet walks out of Wi-Fi range.
+let liveSocket = null;
+await page.routeWebSocket(/\/ws\/live/, (ws) => {
+  liveSocket = ws;
+  ws.connectToServer();
+});
+await page.reload({ waitUntil: 'networkidle' });
+await nav('Dashboard').click();
+await page.waitForTimeout(1500);
+
+await page.getByRole('button', { name: 'Record on this device' }).click();
+await page.waitForSelector('[role=dialog]');
+await page.waitForTimeout(400);
+
+// The dashboard's own channels are pre-selected: the operator asked to record
+// what they are looking at.
+const preselected = await page.locator('[role=dialog] .channels input:checked').count();
+if (preselected === 0) {
+  throw new Error('the dialog did not seed the channels this dashboard shows');
+}
+// Record everything visible, once a second.
+const boxes = page.locator('[role=dialog] .channels input[type=checkbox]');
+for (let i = 0; i < await boxes.count(); ++i) {
+  if (!(await boxes.nth(i).isChecked())) await boxes.nth(i).check();
+}
+await page.locator('[role=dialog] input[type=radio][value="1Hz"]').check();
+await page.locator('[role=dialog] input[type=text]').nth(1).fill('Alexander');
+await page.locator('[role=dialog] input[type=text]').nth(2).fill('TEOS-07');
+await shot('53-local-recording-dialog');
+
+await page.getByRole('button', { name: 'Start recording' }).click();
+await page.waitForSelector('.bar .dot', { timeout: 5000 });
+await page.waitForTimeout(4000);
+await shot('54-local-recording-running');
+
+// The recording must survive leaving the Dashboard: it is not a property of a
+// view being mounted.
+await nav('Hardware').click();
+await page.waitForTimeout(2500);
+if (!(await page.locator('.bar .dot').isVisible())) {
+  throw new Error('the recording indicator vanished when the page changed');
+}
+await shot('55-recording-follows-the-operator');
+
+// Now break the link.  Everything between here and the reconnect must read as
+// a hole in the archive.
+if (!liveSocket) throw new Error('the telemetry socket was never routed');
+liveSocket.close();
+await page.waitForTimeout(7000);
+// live.ts reconnects with backoff; the new socket goes through the same route.
+await page.waitForFunction(
+  () => !document.querySelector('.bar .warn')?.textContent?.includes('link down'),
+  { timeout: 20000 });
+await page.waitForTimeout(4000);
+
+await nav('Dashboard').click();
+await page.waitForTimeout(500);
+const gapsText = await page.locator('.bar .numbers').first().textContent();
+if (!/gaps: [1-9]/.test(gapsText ?? '')) {
+  throw new Error(`losing the link did not produce a gap: "${gapsText?.trim()}"`);
+}
+console.log(`  the outage was recorded: ${gapsText.trim()}`);
+
+// A manual mark, the thing an operator writes down at the bench.
+await page.getByRole('button', { name: 'Mark event' }).click();
+await page.locator('.bar input[type=text]').fill('added solvent');
+await page.getByRole('button', { name: 'Save', exact: true }).click();
+await page.waitForTimeout(600);
+
+await page.getByRole('button', { name: 'Stop', exact: true }).click();
+await page.waitForTimeout(1500);
+
+// --- Local data -----------------------------------------------------------
+await nav('Local data').click();
+await page.waitForSelector('table tbody tr', { timeout: 5000 });
+await page.waitForTimeout(600);
+
+const row = page.locator('table tbody tr').first();
+const rowText = (await row.textContent()) ?? '';
+if (!/COMPLETE/.test(rowText)) {
+  throw new Error(`the finished set is not COMPLETE: ${rowText.replace(/\s+/g, ' ')}`);
+}
+const storedGaps = Number((await row.locator('td').nth(5).textContent())?.trim());
+if (!(storedGaps >= 1)) throw new Error(`the stored set claims ${storedGaps} gaps`);
+const storedRows = Number((((await row.locator('td').nth(4).textContent()) ?? '')
+  .trim().split(/\s+/)[0] ?? '').replace(/[^0-9]/g, ''));
+if (!(storedRows > 3)) throw new Error(`the stored set has ${storedRows} rows`);
+console.log(`  stored locally: ${storedRows} rows, ${storedGaps} gap(s)`);
+await shot('56-local-data');
+
+// Open it: the historical chart reads from IndexedDB, never from the socket.
+await row.locator('button.link').click();
+await page.waitForSelector('.uplot', { timeout: 5000 });
+await page.waitForTimeout(1200);
+const emptyNote = await page.locator('.wrap p.small').first().textContent();
+if (!/empty buckets/.test(emptyNote ?? '')) {
+  throw new Error(`the gap is not visible in the stored view: "${emptyNote?.trim()}"`);
+}
+await shot('57-local-session-chart');
+
+// Export.  The CSV must carry the reproducibility header and the gap count.
+const csvDownload = page.waitForEvent('download', { timeout: 20000 });
+await row.locator('button', { hasText: 'CSV' }).click();
+const csvFile = await csvDownload;
+const csvPath = await csvFile.path();
+const csvText = readFileSync(csvPath, 'utf8');
+for (const needle of ['# source: client IndexedDB', '# controller_id: lc-',
+                      '# operator: Alexander', '# sample: TEOS-07',
+                      'client_epoch_ms,client_iso,device_ms']) {
+  if (!csvText.includes(needle)) {
+    throw new Error(`the exported CSV is missing "${needle}"`);
+  }
+}
+const dataLines = csvText.split('\n').filter((line) => line && !line.startsWith('#'));
+if (dataLines.length < 4) throw new Error('the exported CSV has no rows');
+console.log(`  exported ${dataLines.length - 1} CSV rows with the header intact`);
+
+// And the ZIP, which carries the events alongside the data.
+const zipDownload = page.waitForEvent('download', { timeout: 20000 });
+await row.locator('button', { hasText: 'ZIP' }).click();
+const zipFile = await zipDownload;
+const zipBytes = readFileSync(await zipFile.path());
+if (zipBytes.readUInt32LE(0) !== 0x04034b50) {
+  throw new Error('the exported ZIP does not start with a local file header');
+}
+if (!zipBytes.includes(Buffer.from('events.csv'))) {
+  throw new Error('the exported ZIP has no events.csv');
+}
+console.log(`  exported a ${zipBytes.length}-byte ZIP containing events.csv`);
+
+// Deleting takes the name typed out: this is the only copy unless it was saved.
+await row.locator('button', { hasText: 'Delete' }).click();
+await page.waitForSelector('.danger-panel');
+const deleteButton = page.locator('.danger-panel button', { hasText: 'Delete' });
+if (await deleteButton.isEnabled()) {
+  throw new Error('delete was possible without confirming the name');
+}
+await shot('58-local-delete-confirm');
+const sessionName = (await page.locator('.danger-panel strong').textContent() ?? '')
+  .replace(/^Delete “/, '').replace(/”\?$/, '');
+await page.locator('.danger-panel input').fill(sessionName);
+await deleteButton.click();
+await page.waitForTimeout(1000);
+console.log('  the set was deleted only after its name was typed');
 
 // --- Milestone 11: the lock that never locks the stop button --------------
 await nav('System').click();

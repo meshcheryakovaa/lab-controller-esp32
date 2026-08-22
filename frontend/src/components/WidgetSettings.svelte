@@ -10,7 +10,7 @@
   // ===========================================================================
   import { controller } from '../lib/state.svelte';
   import { widgetType } from '../lib/widgets';
-  import type { Widget, WidgetSeries } from '../lib/widgets';
+  import type { Widget, WidgetField, WidgetSeries } from '../lib/widgets';
 
   let {
     widget = $bindable<Widget | null>(null),
@@ -47,6 +47,13 @@
     if (!widget) return;
     widget.config.series = series().filter((s) => s.channel !== channelKey);
     onchange();
+  }
+
+  /** A select hands back a string; the registry says what the field really is,
+   *  and a "0" stored where 0 was meant is a setting that stops matching. */
+  function coerce(field: WidgetField, raw: string): unknown {
+    const option = field.options?.find((o) => String(o.value) === raw);
+    return option ? option.value : raw;
   }
 
   let seriesPick = $state('');
@@ -131,6 +138,18 @@
             it rather than drawn without an axis.
           </span>
         </div>
+
+      {:else if field.kind === 'choice'}
+        <label class="field">
+          <span class="label">{field.label}</span>
+          <select value={String(widget.config[field.key] ?? field.options?.[0]?.value ?? '')}
+                  onchange={(e) => setValue(field.key, coerce(field, e.currentTarget.value))}>
+            {#each field.options ?? [] as option (option.value)}
+              <option value={String(option.value)}>{option.label}</option>
+            {/each}
+          </select>
+          {#if field.help}<span class="help">{field.help}</span>{/if}
+        </label>
 
       {:else if field.kind === 'number'}
         <label class="field">

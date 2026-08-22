@@ -388,6 +388,27 @@ static void test_system_and_diagnostics_report_real_numbers() {
   TEST_ASSERT_EQUAL_INT(2, diagnostics.body["api"]["requests"].as<int>());
 }
 
+// Milestone 14: the browser files local recordings under this string, so two
+// rigs that share an address must not share an identity.  A blank or missing
+// field would make a client fall back to the origin, and in access-point mode
+// every controller is 192.168.4.1 — two experiments in one archive, silently.
+static void test_system_names_the_controller_independently_of_its_address() {
+  ApiRig rig;
+  const ApiResponse system = rig.get("/api/v1/system");
+  TEST_ASSERT_EQUAL_INT(200, system.status);
+  TEST_ASSERT_TRUE(system.body["controller_id"].is<const char*>());
+  const char* id = system.body["controller_id"];
+  TEST_ASSERT_NOT_NULL(id);
+  // Never empty: an empty identity is the failure this field exists to prevent.
+  TEST_ASSERT_TRUE(std::strlen(id) > 0);
+  // Stable across calls — it is an identity, not a nonce.
+  const ApiResponse again = rig.get("/api/v1/system");
+  TEST_ASSERT_EQUAL_STRING(id, again.body["controller_id"]);
+  // And it is not the address.
+  TEST_ASSERT_TRUE(std::strcmp(id, "0.0.0.0") != 0);
+  TEST_ASSERT_TRUE(std::strcmp(id, "192.168.4.1") != 0);
+}
+
 static void test_reboot_requires_post_and_calls_the_hook() {
   ApiRig rig;
   g_rebootCalls = 0;
@@ -2790,6 +2811,7 @@ int main(int, char**) {
   RUN_TEST(test_gpio_endpoint_explains_why_a_pin_is_unavailable);
   RUN_TEST(test_unknown_routes_and_methods_are_refused_cleanly);
   RUN_TEST(test_system_and_diagnostics_report_real_numbers);
+  RUN_TEST(test_system_names_the_controller_independently_of_its_address);
   RUN_TEST(test_reboot_requires_post_and_calls_the_hook);
   RUN_TEST(test_dry_run_validates_without_creating_anything);
   RUN_TEST(test_dry_run_and_create_agree_about_a_taken_key);

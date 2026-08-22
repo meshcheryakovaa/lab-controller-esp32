@@ -8,6 +8,8 @@
 #include <WiFi.h>
 #include <esp_heap_caps.h>
 
+#include <cstdio>
+
 #include "api/SystemMetrics.h"
 
 namespace lc {
@@ -60,6 +62,23 @@ class Esp32SystemMetrics final : public ISystemMetrics {
 
   std::int32_t wifiRssi() const override {
     return (WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : 0;
+  }
+
+  /**
+   * From the eFuse MAC: burned at the factory, identical across reflashes and
+   * OTA updates, and unaffected by which network the board is on.  That last
+   * part is the point — in access-point mode every controller is 192.168.4.1,
+   * so a browser storing recordings per origin needs something else to tell
+   * two rigs apart (§M14).
+   */
+  const char* controllerId() const override {
+    static char buffer[16];
+    if (buffer[0] == '\0') {
+      const std::uint64_t mac = ESP.getEfuseMac();
+      std::snprintf(buffer, sizeof(buffer), "lc-%012llx",
+                    static_cast<unsigned long long>(mac & 0xFFFFFFFFFFFFULL));
+    }
+    return buffer;
   }
 };
 

@@ -54,9 +54,13 @@ class PsychicHttpAdapter final : public IWebSocketSink {
   // `pio run -t uploadfs` puts it on the board.
   static constexpr const char* kWebRoot = "/www";
 
+  // `controllerId` is the same string GET /api/v1/system reports.  It is passed
+  // in rather than read from the metrics here so that the hello a client sees
+  // on connect and the one it read over REST cannot disagree (§M14).
   PsychicHttpAdapter(RestApi& api, TelemetryBatcher& telemetry,
-                     ConfigStorage& storage)
-      : api_(api), telemetry_(telemetry), storage_(storage) {}
+                     ConfigStorage& storage, const char* controllerId)
+      : api_(api), telemetry_(telemetry), storage_(storage),
+        controllerId_(controllerId != nullptr ? controllerId : "lc-000000000000") {}
 
   // Registers every route and starts the server.  MUST be called after the
   // network is up: PsychicHttpServer::start() refuses to run without a
@@ -84,6 +88,7 @@ class PsychicHttpAdapter final : public IWebSocketSink {
   RestApi& api_;
   TelemetryBatcher& telemetry_;
   ConfigStorage& storage_;
+  const char* controllerId_;
 
   PsychicHttpServer server_{kPort};
   PsychicWebSocketHandler websocket_;

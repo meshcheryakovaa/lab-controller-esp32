@@ -11,6 +11,9 @@
   import DiagnosticsView from './views/DiagnosticsView.svelte';
   import HardwareView from './views/HardwareView.svelte';
   import SystemView from './views/SystemView.svelte';
+  import LocalDataView from './views/LocalDataView.svelte';
+  import LocalRecordingStatus from './components/LocalRecordingStatus.svelte';
+  import { recorder } from './lib/client-recorder.svelte';
 
   const sections = [
     { id: 'dashboard', label: 'Dashboard' },
@@ -19,6 +22,10 @@
     { id: 'control', label: 'Control' },
     { id: 'experiments', label: 'Experiments' },
     { id: 'logs', label: 'Logs' },
+    // M14.  Deliberately its own page and not a tab of Logs: those datasets are
+    // on the controller and survive a closed browser; these are on this device
+    // and do not.  Filing them together would blur exactly that difference.
+    { id: 'local', label: 'Local data' },
     { id: 'system', label: 'System' },
     { id: 'diagnostics', label: 'Diagnostics' },
   ] as const;
@@ -31,6 +38,10 @@
 
   onMount(() => {
     const stop = controller.start();
+    // pagehide may be the last code that runs, and may not run at all.  Used
+    // for a best-effort flush only; nothing is built on it (§14).
+    const onHide = () => recorder.flushBeforeUnload();
+    window.addEventListener('pagehide', onHide);
     void (async () => {
       try {
         await controller.loadStatic();
@@ -41,7 +52,10 @@
         booting = false;
       }
     })();
-    return stop;
+    return () => {
+      window.removeEventListener('pagehide', onHide);
+      stop();
+    };
   });
 
   const errorDevices = $derived(
@@ -120,6 +134,11 @@
   </aside>
 
   <main>
+    <!-- M14: a running local recording, or one that stopped because the device
+         filled up, has to be visible from every page.  A recording that died an
+         hour ago while the operator was on the Hardware page is the failure this
+         prevents. -->
+    <LocalRecordingStatus onopen={() => (active = 'local')} />
     <header class="topbar">
       <h1>{sections.find((s) => s.id === active)?.label}</h1>
       {#if controller.loading}<span class="muted">refreshing…</span>{/if}
@@ -213,6 +232,8 @@
       <ExperimentsView />
     {:else if active === 'logs'}
       <LogsView />
+    {:else if active === 'local'}
+      <LocalDataView />
     {:else if active === 'system'}
       <SystemView />
     {:else}

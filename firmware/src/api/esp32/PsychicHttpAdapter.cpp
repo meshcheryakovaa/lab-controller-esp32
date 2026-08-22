@@ -290,6 +290,7 @@ void PsychicHttpAdapter::sendHello(PsychicWebSocketClient* client) {
   hello["firmware"] = LC_FIRMWARE_VERSION;
   hello["schema_version"] = ConfigStorage::kSchemaVersion;
   hello["config_revision"] = storage_.revision();
+  hello["controller_id"] = controllerId_;
   hello["max_rate_hz"] = TelemetryBatcher::kMaxRateHz;
 
   String payload;

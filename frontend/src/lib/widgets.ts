@@ -74,7 +74,12 @@ export interface DashboardSummary {
 }
 
 /** How the editor asks for a widget's settings. Deliberately tiny. */
-export type FieldKind = 'channel' | 'channels' | 'text' | 'number' | 'loop';
+export type FieldKind = 'channel' | 'channels' | 'text' | 'number' | 'loop' | 'choice';
+
+export interface FieldOption {
+  value: number | string;
+  label: string;
+}
 
 export interface WidgetField {
   key: string;
@@ -83,6 +88,8 @@ export interface WidgetField {
   help?: string;
   min?: number;
   max?: number;
+  /** For `choice`: the whole vocabulary of the field. */
+  options?: FieldOption[];
 }
 
 export interface WidgetType {
@@ -122,8 +129,17 @@ export const WIDGET_TYPES: WidgetType[] = [
     minSize: { w: 4, h: 3 },
     fields: [
       { key: 'series', label: 'Channels', kind: 'channels' },
-      { key: 'window_s', label: 'Window', kind: 'number', min: 10, max: 86400,
-        help: 'Seconds of history to show' },
+      // A free number here was a promise the browser could not keep: it kept
+      // three minutes of history, so "3600" drew three minutes and said an
+      // hour.  The three the chart can actually show are the three offered.
+      { key: 'window_s', label: 'Default range', kind: 'choice',
+        options: [
+          { value: 0, label: 'All time' },
+          { value: 300, label: 'Last 5 minutes' },
+          { value: 600, label: 'Last 10 minutes' },
+        ],
+        help: 'Where the buttons on the tile start; the operator can change it '
+            + 'without saving the dashboard' },
     ],
     defaults: (channel) => ({
       series: channel ? [{ channel }] : [],

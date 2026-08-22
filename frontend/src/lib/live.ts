@@ -51,6 +51,14 @@ export class LiveConnection {
   private reconnectTimer = 0;
   private revision = -1;
 
+  /**
+   * Which controller is on the other end (M14).  Read from `hello` rather than
+   * inferred from the address: in access-point mode every board answers on
+   * 192.168.4.1, and a browser filing local recordings by origin would pour two
+   * different rigs into one archive.
+   */
+  controllerId = '';
+
   readonly latest = new Map<number, number>();
 
   constructor(private readonly url = defaultUrl()) {}
@@ -191,6 +199,9 @@ export class LiveConnection {
       }
       case 'hello': {
         this.revision = Number(message.config_revision ?? -1);
+        if (typeof message.controller_id === 'string' && message.controller_id) {
+          this.controllerId = message.controller_id;
+        }
         this.configListeners.forEach((fn) => fn(this.revision));
         break;
       }

@@ -2,30 +2,35 @@
   // ===========================================================================
   //  LineChart — uPlot wrapper.
   //
-  //  History lives in the browser (see state.svelte.ts): the ESP32 has neither
-  //  the RAM to keep it nor any reason to re-send it every time a chart mounts.
+  //  History lives in the browser (see lib/chart-history.ts): the ESP32 has
+  //  neither the RAM to keep it nor any reason to re-send it every time a chart
+  //  mounts.  It is bounded there, so this component never sees an array that
+  //  grows with uptime.
   //
-  //  Redraw is throttled to 4 Hz regardless of how fast frames arrive.  The eye
-  //  cannot use more, and on a tablet the difference between 4 and 20 redraws
-  //  per second is the difference between smooth and warm.
+  //  Redraw is throttled to 4 Hz AND conditional.  The eye cannot use more than
+  //  four frames a second on a trend line, and rebuilding the series when no
+  //  reading has arrived is the loop that made an eight-hour dashboard feel
+  //  like a hung instrument.
   // ===========================================================================
   import { onMount } from 'svelte';
   import uPlot from 'uplot';
   import 'uplot/dist/uPlot.min.css';
   import { controller } from '../lib/state.svelte';
+  import type { ChartRange } from '../lib/chart-history';
 
   let {
     handles = [],
     height = 260,
-    // Seconds of history to show.  0 means "everything the browser is holding".
-    // A widget that offers a window setting and then ignores it is worse than
-    // one that never offered it.
-    windowSeconds = 0,
-  }: { handles?: number[]; height?: number; windowSeconds?: number } = $props();
+    // Which span to draw.  Chosen by the buttons above the chart; the stored
+    // window_s only decides where those buttons start.
+    range = 'all',
+  }: { handles?: number[]; height?: number; range?: ChartRange } = $props();
 
   // Three Y axes is the documented readability limit; beyond that the reader
   // cannot tell which axis a line belongs to.
   const MAX_AXES = 3;
+
+  const REDRAW_MS = 250;
 
   let container: HTMLDivElement;
   let chart: uPlot | null = null;
@@ -85,53 +90,43 @@
           stroke: channel?.color ?? '#4c9aff',
           width: 1.5,
           scale: channel?.unit || 'y',
+          // A dropped connection is a hole, not a straight line across it.
+          spanGaps: false,
         })),
       ],
     };
   }
 
   function collect(): uPlot.AlignedData {
-    // Channels update independently, so one timebase is chosen and the others
-    // are sampled onto it — good enough for a live view; exact reconstruction
-    // is the CSV export's job, not the dashboard's.
-    //
-    // The base is the channel with the MOST history, not the first one: a
-    // sensor that has produced nothing yet (a load cell with no cell attached,
-    // say) used to blank the whole chart just by being first in the selection.
-    const drawn = layout.drawn;
-    let x: number[] = [];
-    for (const handle of drawn) {
-      const time = controller.historyFor(handle).time;
-      if (time.length > x.length) x = time;
-    }
-    x = x.slice();
-    if (windowSeconds > 0 && x.length > 0) {
-      const newest = x[x.length - 1]!;
-      const oldest = newest - windowSeconds * 1000;
-      const from = x.findIndex((t) => t >= oldest);
-      if (from > 0) x = x.slice(from);
-    }
-
-    const series = drawn.map((handle) => {
-      const history = controller.historyFor(handle);
-      return x.map((t) => {
-        const index = nearest(history.time, t);
-        return index >= 0 ? history.value[index]! : null;
-      });
-    });
-    return [x, ...series] as uPlot.AlignedData;
+    // uPlot wants [x, ...series]; the history hands back the two separately so
+    // that the alignment can be tested without uPlot in the room.
+    const data = controller.chartData(layout.drawn, range, width);
+    return [data.x, ...data.series] as uPlot.AlignedData;
   }
 
-  function nearest(times: number[], t: number): number {
-    if (times.length === 0) return -1;
-    let low = 0;
-    let high = times.length - 1;
-    while (low < high) {
-      const mid = (low + high) >> 1;
-      if (times[mid]! < t) low = mid + 1;
-      else high = mid;
-    }
-    return low;
+  // What the chart is currently showing.  Redrawing when none of this has moved
+  // draws the same picture again, which is all the old unconditional timer did.
+  let shownRevision = -1;
+  let shownKey = '';
+  let shownRange: ChartRange | '' = '';
+  let shownWidth = -1;
+
+  function redraw(force = false): void {
+    if (!chart) return;
+    // A hidden tab still receives telemetry and still fills its history; what
+    // it must not do is lay out and paint a canvas nobody is looking at.
+    if (!force && typeof document !== 'undefined'
+        && document.visibilityState === 'hidden') return;
+    const drawn = layout.drawn;
+    const revision = controller.historyRevision(drawn);
+    const key = drawn.join(',');
+    if (!force && revision === shownRevision && key === shownKey
+        && range === shownRange && width === shownWidth) return;
+    shownRevision = revision;
+    shownKey = key;
+    shownRange = range;
+    shownWidth = width;
+    chart.setData(collect());
   }
 
   onMount(() => {
@@ -144,10 +139,18 @@
     });
     observer.observe(container);
 
-    const timer = setInterval(() => chart?.setData(collect()), 250);
+    const timer = setInterval(() => redraw(), REDRAW_MS);
+
+    // Coming back to the tab is the one moment a full redraw is owed: the
+    // history moved on while nothing was being painted.
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible') redraw(true);
+    };
+    document.addEventListener('visibilitychange', onVisibility);
 
     return () => {
       clearInterval(timer);
+      document.removeEventListener('visibilitychange', onVisibility);
       observer.disconnect();
       chart?.destroy();
       chart = null;
@@ -160,6 +163,17 @@
     if (!chart || !key) return;
     chart.destroy();
     chart = new uPlot(buildOptions(), collect(), container);
+    shownKey = key;
+    shownRange = range;
+    shownWidth = width;
+    shownRevision = controller.historyRevision(layout.drawn);
+  });
+
+  // A new range is a new picture, and waiting up to 250 ms for the timer to
+  // notice would make the buttons feel broken.
+  $effect(() => {
+    void range;
+    redraw(true);
   });
 
   const skippedNames = $derived(
