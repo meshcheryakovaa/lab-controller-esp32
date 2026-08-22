@@ -1,6 +1,7 @@
 #include "api/esp32/PsychicHttpAdapter.h"
 
 #include <LittleFS.h>
+#include <esp_heap_caps.h>
 
 #include <cstring>
 
@@ -338,19 +339,84 @@ void PsychicHttpAdapter::handleWebSocketFrame(PsychicWebSocketRequest* request,
   }
 }
 
+/**
+ * KNOWN HAZARD, NOT FIXED HERE (0.15.2-m15).
+ *
+ * `getClientList()` hands back PsychicHttp's `std::list<PsychicClient*>`, and
+ * `sendAll()` below walks the same list.  Both run on OUR task — the telemetry
+ * batcher is a scheduler task on the Arduino loop — while the HTTP server's own
+ * task calls `push_back()` and `remove()` on that list every time a browser
+ * connects or disconnects.  Nothing serialises the two.  Iterating a std::list
+ * while another task splices nodes out of it is undefined behaviour, and its
+ * usual symptom is a jump through a freed node: `Backtrace ... |<-CORRUPTED`,
+ * the same signature as the heap exhaustion this release fixes.
+ *
+ * It is checked and still present in 3.1.2 — the mutex that version added
+ * guards the receive buffer, not the client list.  It is NOT the cause of the
+ * 43-second reset (that failure needed no reconnection, and its timing was far
+ * too regular for a race), so it is recorded rather than guessed at: fixing it
+ * means moving the send onto the HTTP task with httpd_queue_work, which is a
+ * change no test here can cover and no bench is available to prove.
+ *
+ * If resets survive this release AND correlate with connecting or reloading the
+ * page rather than with leaving it open, this is the first place to look.
+ */
 std::size_t PsychicHttpAdapter::clientCount() const {
   return const_cast<PsychicWebSocketHandler&>(websocket_).getClientList().size();
 }
 
+/**
+ * May a telemetry frame be queued right now?
+ *
+ * THE COMMENT THAT USED TO BE HERE WAS WRONG, AND THE BOARD PAID FOR IT.
+ * It claimed esp_http_server sends synchronously from the HTTP task, so that
+ * there was no pending-frame state worth inspecting.  PsychicHttp does not send
+ * synchronously.  Every frame is copied onto the heap — a `httpd_ws_frame_t`
+ * plus a malloc'd duplicate of the payload — and handed to
+ * `httpd_ws_send_data_async`; the memory is released by a completion callback
+ * that runs only once the frame has actually gone out.
+ *
+ * So a client that stops draining its socket (a tablet that walked out of
+ * range, a laptop that slept, a half-open TCP connection Wi-Fi has not noticed
+ * yet) does not slow telemetry down.  It makes telemetry accumulate.  Twelve
+ * channels at 5 Hz is five allocations a second that are never freed, and the
+ * board reset roughly 43 seconds in — reproducibly, because heap exhaustion on
+ * a fixed allocation rate is a clock.
+ *
+ * Two independent defences now:
+ *
+ *   1. PSYCHIC_WS_MAX_PENDING_FRAMES (platformio.ini) bounds the queue inside
+ *      the library, per client.
+ *   2. This heap floor, which does not depend on the library version, on the
+ *      value of that macro, or on the number of clients.
+ *
+ * Dropping telemetry frames is the RIGHT failure here, and worth being explicit
+ * about: a live readout needs the newest value, not a backlog of stale ones.
+ * Nothing that must not be lost travels this way — datasets go through the log
+ * store and segments are handed over with a checksum and an acknowledgement.
+ */
 bool PsychicHttpAdapter::canSend() const {
-  // esp_http_server sends synchronously from the HTTP task, so there is no
-  // pending-frame state to inspect; the guard that matters is the client limit.
-  return clientCount() > 0 && clientCount() <= kMaxWebSocketClients;
+  if (clientCount() == 0 || clientCount() > kMaxWebSocketClients) return false;
+
+  // Below this, the instrument still has to answer HTTP, serve the interface
+  // and save its configuration.  A live chart is the first thing that should
+  // give way, and it gives way silently and reversibly: the moment the client
+  // drains its queue and the callbacks free those frames, this passes again.
+  const std::size_t freeHeap = ESP.getFreeHeap();
+  if (freeHeap < kTelemetryHeapFloorBytes) return false;
+
+  // Fragmentation matters as much as the total.  Each frame needs one
+  // contiguous block for its payload, so a heap with plenty free and nothing
+  // contiguous cannot serve a frame either — and finding that out inside the
+  // library costs a failed malloc per frame.
+  return heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) >= kTelemetryBlockFloorBytes;
 }
 
 bool PsychicHttpAdapter::broadcast(const char* text, std::size_t length) {
-  (void)length;
-  websocket_.sendAll(text);
+  // The length is passed rather than letting the library call strlen(): the
+  // batcher knows exactly how much of its buffer it filled, and a frame sized
+  // by a terminator is a frame that trusts the buffer to hold one.
+  websocket_.sendAll(HTTPD_WS_TYPE_TEXT, text, length);
   return true;
 }
 

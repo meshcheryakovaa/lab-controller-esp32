@@ -73,7 +73,20 @@ class SystemManager {
   // A boot is considered successful once the system has run this long without
   // resetting.  Short enough to be reached in a normal session, long enough to
   // outlive a driver that hangs during initialisation.
-  static constexpr Micros kHealthyUptimeUs = 30ULL * 1000000ULL;
+  //
+  // RAISED FROM 30 SECONDS TO 120 (0.15.2-m15).  Thirty was chosen against
+  // failures that happen DURING start-up, and it silently disarmed the escape
+  // hatch for the failure that actually occurred: a WebSocket client caused a
+  // reset about 43 seconds in, every time.  Each cycle therefore cleared the
+  // failure streak at 30 s and died at 43 s, so three consecutive failures
+  // could never be counted and safe mode never armed — the board simply looped
+  // for as long as somebody left the page open.
+  //
+  // The threshold has to outlive the SLOWEST plausible crash, not the fastest.
+  // Two minutes covers a fault that needs a client to connect and then some
+  // resource to accumulate, which is the shape of every failure that has
+  // actually reached this instrument.
+  static constexpr Micros kHealthyUptimeUs = 120ULL * 1000000ULL;
   static constexpr std::uint8_t kMaxConsecutiveFailures = 3;
 
   struct Services {

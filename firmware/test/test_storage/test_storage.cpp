@@ -309,6 +309,65 @@ static void test_repeated_boot_failures_lead_to_safe_mode() {
   TEST_ASSERT_EQUAL_UINT(0, rig.devices.activeCount());
 }
 
+// ---------------------------------------------------------------------------
+//  0.15.2-m15 — a boot loop that outlived the healthy threshold.
+//
+//  The board crashed about 43 seconds after boot, every time.  Safe mode never
+//  armed, because a boot was declared healthy at 30 seconds — so each cycle
+//  cleared the failure streak 13 seconds before the crash that should have
+//  incremented it.  Three failures in a row could never be counted, and the
+//  escape hatch designed for exactly this situation stayed shut.
+//
+//  The test crashes the rig at 43 s, three times, and demands safe mode.
+// ---------------------------------------------------------------------------
+static void test_a_crash_after_the_healthy_mark_still_reaches_safe_mode() {
+  MemoryBootCounter counter;
+
+  // Three boots that each run for 43 seconds and then die.
+  for (int cycle = 0; cycle < SystemManager::kMaxConsecutiveFailures; ++cycle) {
+    Rig rig;
+    rig.writeRaw("/config/devices.json", kOneSimulator);
+    rig.bootCounter = counter;  // the counter survives a reset; the rig does not
+
+    const BootReport& report = rig.system.begin();
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(BootMode::kNormal),
+                          static_cast<int>(report.mode));
+
+    // Run to just before the crash, the way loop() does.
+    rig.clock.advanceMicros(43ULL * 1000000ULL);
+    rig.system.loop();
+    counter = rig.bootCounter;  // ...and then the board resets
+  }
+
+  // The fourth boot must refuse to start the devices.  With the threshold at
+  // 30 s this failed: the counter was zero every time.
+  Rig rig;
+  rig.writeRaw("/config/devices.json", kOneSimulator);
+  rig.bootCounter = counter;
+  const BootReport& report = rig.system.begin();
+  TEST_ASSERT_EQUAL_INT(static_cast<int>(BootMode::kSafe),
+                        static_cast<int>(report.mode));
+  TEST_ASSERT_EQUAL_UINT(0, rig.devices.activeCount());
+}
+
+// A boot that really does survive must still clear the streak, or the escape
+// hatch would eventually fire on a perfectly healthy instrument.
+static void test_a_boot_that_survives_clears_the_failure_streak() {
+  Rig rig;
+  rig.writeRaw("/config/devices.json", kOneSimulator);
+  rig.bootCounter.markAttempt();
+  rig.bootCounter.markAttempt();
+  rig.system.begin();
+
+  rig.clock.advanceMicros(SystemManager::kHealthyUptimeUs - 1);
+  rig.system.loop();
+  TEST_ASSERT_TRUE(rig.bootCounter.consecutiveFailures() > 0);
+
+  rig.clock.advanceMicros(2);
+  rig.system.loop();
+  TEST_ASSERT_EQUAL_UINT(0, rig.bootCounter.consecutiveFailures());
+}
+
 static void test_one_bad_device_does_not_stop_the_others() {
   Rig rig;
   rig.writeRaw("/config/devices.json", R"({
@@ -1109,6 +1168,8 @@ int main(int, char**) {
   RUN_TEST(test_full_filesystem_fails_loudly);
   RUN_TEST(test_first_boot_without_configuration_is_normal);
   RUN_TEST(test_repeated_boot_failures_lead_to_safe_mode);
+  RUN_TEST(test_a_crash_after_the_healthy_mark_still_reaches_safe_mode);
+  RUN_TEST(test_a_boot_that_survives_clears_the_failure_streak);
   RUN_TEST(test_one_bad_device_does_not_stop_the_others);
   RUN_TEST(test_processing_section_is_applied_to_named_channels);
   RUN_TEST(test_a_device_lives_and_dies_by_the_configuration_file);

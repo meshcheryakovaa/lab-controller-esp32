@@ -48,8 +48,15 @@ FILES="
   src/main.cpp
 "
 
+# ARDUINO is defined by the real PlatformIO build, and PsychicHttp 3.x branches
+# on it: without it the library selects its native-ESP-IDF filesystem shim and
+# PsychicFileResponse loses the fs::FS overload the adapter calls.  Compiling
+# without it would report a break that does not exist on the target — and, worse,
+# could hide one that does.
 FLAGS="-std=gnu++17 -fsyntax-only -Wall -Wextra -Wno-unused-parameter
+  -D ARDUINO=200
   -D LC_TARGET_ESP32=1 -D LC_HAS_PSRAM=0
+  -D PSYCHIC_WS_MAX_PENDING_FRAMES=4
   -D LC_FIRMWARE_VERSION=\"typecheck\" -D LC_CONFIG_SCHEMA_VERSION=1
   -D ARDUINOJSON_ENABLE_STD_STRING=1
   -I $root/firmware/src
@@ -59,6 +66,15 @@ FLAGS="-std=gnu++17 -fsyntax-only -Wall -Wextra -Wno-unused-parameter
 
 CXX="${CXX:-g++}"
 status=0
+
+# Optionally compile the WebSocket adapter against a SECOND PsychicHttp as well.
+# 0.15.2-m15 moved from 2.2.0 to 3.1.2 for the bounded WebSocket send queue, and
+# 3.x changed the PsychicFileResponse constructor.  Checking both means the
+# upgrade stays reversible: if 3.x turns out to misbehave on the bench, reverting
+# the pin is a one-line change that is known to still compile.
+#   PSYCHIC_ALT_SRC=/path/to/other/src ./check.sh
+PSYCHIC_ALT_SRC="${PSYCHIC_ALT_SRC:-}"
+
 for file in $FILES; do
   printf '%-45s ' "$file"
   # shellcheck disable=SC2086
@@ -76,4 +92,32 @@ for file in $FILES; do
     status=1
   fi
 done
+
+if [ -n "$PSYCHIC_ALT_SRC" ]; then
+  if [ ! -d "$PSYCHIC_ALT_SRC" ]; then
+    echo "PSYCHIC_ALT_SRC is set but $PSYCHIC_ALT_SRC does not exist" >&2
+    exit 2
+  fi
+  ALT_FLAGS="${FLAGS/-I $PSYCHIC_SRC/-I $PSYCHIC_ALT_SRC}"
+  echo
+  echo "against the alternate PsychicHttp ($PSYCHIC_ALT_SRC):"
+  for file in src/api/esp32/PsychicHttpAdapter.cpp src/main.cpp; do
+    printf '%-45s ' "$file"
+    # shellcheck disable=SC2086
+    if $CXX $ALT_FLAGS "$root/firmware/$file" 2> /tmp/typecheck.err; then
+      if [ -s /tmp/typecheck.err ]; then
+        echo "WARN"
+        cat /tmp/typecheck.err
+        status=1
+      else
+        echo "ok"
+      fi
+    else
+      echo "FAIL"
+      head -40 /tmp/typecheck.err
+      status=1
+    fi
+  done
+fi
+
 exit $status

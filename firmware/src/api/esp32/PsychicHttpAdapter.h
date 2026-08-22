@@ -50,6 +50,17 @@ class PsychicHttpAdapter final : public IWebSocketSink {
   // Each WebSocket client costs a control block and a send buffer.  Four is
   // generous for a lab instrument and keeps the memory bill predictable.
   static constexpr std::size_t kMaxWebSocketClients = 4;
+
+  // --- telemetry backpressure (0.15.2-m15) ----------------------------------
+  // WebSocket frames are queued asynchronously and copied onto the heap, so a
+  // client that has stopped reading turns a live chart into a memory leak with
+  // a stopwatch on it.  See canSend() for the full account.
+  //
+  // 40 KB leaves room for an HTTP request, a JsonDocument and a configuration
+  // save while the chart is stalled; 4 KB is comfortably more than one frame,
+  // so a frame is refused before the library's malloc can fail.
+  static constexpr std::size_t kTelemetryHeapFloorBytes = 40 * 1024;
+  static constexpr std::size_t kTelemetryBlockFloorBytes = 4 * 1024;
   // Where the frontend lives on LittleFS.  The build hook writes here and
   // `pio run -t uploadfs` puts it on the board.
   static constexpr const char* kWebRoot = "/www";
