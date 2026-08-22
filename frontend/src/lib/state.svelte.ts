@@ -18,6 +18,7 @@ import { api, ApiRequestError, type GpioMap } from './api';
 import { ChannelHistory, chartData, type AlignedHistory, type ChartRange } from './chart-history';
 import { kUnknownRevision, live } from './live';
 import { recorder } from './client-recorder.svelte';
+import { offload } from './log-offload/offload.svelte';
 import type {
   AuthStatus, Calibration, Channel, ChannelQuality, ControlDocument, Device,
   LoggingStatus, ModuleManifest, RunStatus,
@@ -222,6 +223,10 @@ export class ControllerState {
       }
       this.configRevision = Number(system.config_revision ?? -1);
       void recorder.attach(this.controllerId);
+      // M15: a continuous log left running by a previous page must be picked up
+      // again, or its segments would queue on the controller until its flash
+      // filled.  Re-attaching is idempotent.
+      void this.resumeOffload();
       this.subscribeToVisibleChannels();
     } catch (error) {
       this.loadError = describe(error);
@@ -408,6 +413,29 @@ export class ControllerState {
   }
 
   /**
+   * Take over collecting whatever continuous log this controller is running
+   * (M15).  Called after every descriptor refresh, because that is when a
+   * reload, a reconnect or a newly started session becomes visible.
+   */
+  async resumeOffload(): Promise<void> {
+    await offload.open(this.controllerId);
+    const active = this.logging;
+    if (!active?.recording || !active.id) return;
+    try {
+      const queue = await api.logSegments(active.id);
+      if (queue.mode !== 'continuous_offload') return;
+      await offload.attach(active.id, {
+        name: active.name,
+        rows: active.rows,
+        startedEpochMs: Date.now(),
+      });
+    } catch {
+      // A controller that cannot answer is not an error worth showing here;
+      // the Logs page reports the link, and the collector keeps waiting.
+    }
+  }
+
+  /**
    * Ask the firmware for exactly the channels we can display — plus the ones a
    * local recording needs.  A recording does not stop because the operator
    * walked to the Hardware page, so its channels stay subscribed even when no
@@ -473,6 +501,12 @@ export class ControllerState {
       void recorder.onConfigChanged(revision);
     });
 
+    const offSegment = live.onLogSegmentReady(() => {
+      // A notification, not a source of truth: it only makes collection prompt.
+      // The two-second poll is what makes it certain (§15).
+      offload.nudgeActive();
+    });
+
     const offAlert = live.onAlert((severity, code, message) => {
       this.alerts = [
         { id: ++this.alertSeq, severity, code, message, at: Date.now() },
@@ -486,6 +520,7 @@ export class ControllerState {
       offFrame();
       offDevice();
       offConfig();
+      offSegment();
       offAlert();
       live.close();
     };

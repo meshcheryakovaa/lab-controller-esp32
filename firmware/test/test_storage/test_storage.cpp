@@ -19,6 +19,8 @@
 #include "storage/ControlStore.h"
 #include "storage/ConfigStorage.h"
 #include "platform/host/HostRandom.h"
+#include "core/Crc32.h"
+#include "storage/LogStore.h"
 #include "storage/PosixBackend.h"
 
 using namespace lc;
@@ -639,6 +641,386 @@ static void test_the_run_log_keeps_the_newest_records_and_drops_the_oldest() {
                          runs["runs"][0]["started_epoch_ms"].as<std::uint64_t>());
 }
 
+
+// ===========================================================================
+//  Milestone 15 — continuous segmented logging.
+//
+//  The dangerous operation this milestone introduces is DELETING A FILE THAT
+//  HOLDS MEASUREMENTS, on the word of a browser.  So most of what follows is
+//  about the conditions under which that word is accepted, and about what
+//  survives when it is not: a wrong checksum, a wrong size, a different
+//  collector and a power cut must all leave the data exactly where it is.
+// ===========================================================================
+namespace m15 {
+
+LogSpec continuousSpec(std::size_t segmentBytes) {
+  LogSpec spec;
+  spec.name.assign("evaporation");
+  spec.operatorName.assign("alexander");
+  spec.sample.assign("TEOS-07");
+  spec.rateHz = 1.0f;
+  spec.includeRaw = false;
+  spec.channelCount = 2;
+  spec.storageMode = LogStorageMode::kContinuousOffload;
+  spec.segmentBytes = segmentBytes;
+  spec.collectorId.assign("browser-01");
+  return spec;
+}
+
+const char* kColumns[] = {"bath.degC", "heater.pct"};
+
+// One batch of identical rows, so the byte count is predictable and a test can
+// aim at a segment boundary rather than hope for one.
+std::string makeRows(std::uint32_t from, std::uint32_t count) {
+  std::string text;
+  char row[96];
+  for (std::uint32_t i = 0; i < count; ++i) {
+    std::snprintf(row, sizeof(row), "%u,1787351160000,%u,42.125,61.330,0\n",
+                  static_cast<unsigned>((from + i) * 1000),
+                  static_cast<unsigned>(from + i));
+    text += row;
+  }
+  return text;
+}
+
+LogBatch batchOf(const std::string& text, std::uint32_t first, std::uint32_t rows) {
+  LogBatch batch;
+  batch.text = text.c_str();
+  batch.bytes = text.size();
+  batch.rows = rows;
+  batch.firstGlobalRow = first;
+  batch.lastGlobalRow = first + rows - 1;
+  return batch;
+}
+
+std::string readFile(platform::PosixBackend& backend, const char* path) {
+  const Result<std::size_t> size = backend.size(path);
+  if (!size.ok()) return std::string();
+  std::string out(size.value() + 1, '\0');
+  const Result<std::size_t> read = backend.read(path, &out[0], out.size());
+  if (!read.ok()) return std::string();
+  out.resize(read.value());
+  return out;
+}
+
+/** The bytes the checksum is defined over: everything between the column line
+ *  and the footer.  Written out here on purpose — a test that reused the
+ *  production slicing would pass even if that slicing were wrong. */
+std::string payloadOf(const std::string& file) {
+  const std::size_t columns = file.find("quality_mask\n");
+  if (columns == std::string::npos) return std::string();
+  const std::size_t start = columns + std::strlen("quality_mask\n");
+  const std::size_t footer = file.find("# segment_complete", start);
+  if (footer == std::string::npos) return file.substr(start);
+  return file.substr(start, footer - start);
+}
+
+}  // namespace m15
+
+static void test_a_continuous_session_rotates_at_its_segment_limit() {
+  Rig rig;
+  TEST_ASSERT_TRUE(rig.logStore.begin().ok());
+
+  KeyString id;
+  const LogSpec spec = m15::continuousSpec(LogStore::kMinSegmentBytes);
+  TEST_ASSERT_TRUE(rig.logStore.openSession(spec, m15::kColumns, 2, id).ok());
+
+  // Enough to fill three parts and start a fourth.
+  std::uint32_t row = 1;
+  for (int i = 0; i < 60; ++i) {
+    const std::string text = m15::makeRows(row, 40);
+    TEST_ASSERT_TRUE(rig.logStore.appendRows(m15::batchOf(text, row, 40)).ok());
+    row += 40;
+  }
+
+  LogStore::SegmentInfo waiting[LogStore::kMaxPendingSegments];
+  const std::size_t count =
+      rig.logStore.listSegments(id.c_str(), waiting, LogStore::kMaxPendingSegments);
+  TEST_ASSERT_TRUE(count >= 2);
+
+  std::uint32_t previousLast = 0;
+  for (std::size_t i = 0; i < count; ++i) {
+    // Sequences are dense and increasing: a hole here is a lost part.
+    TEST_ASSERT_EQUAL_UINT(i + 1, waiting[i].sequence);
+    // The limit is a promise about the FILE, footer included.
+    TEST_ASSERT_TRUE(waiting[i].bytes <= LogStore::kMinSegmentBytes);
+    // And the global row numbers run on across the boundary without a gap and
+    // without a repeat — which is what makes the parts one experiment.
+    TEST_ASSERT_EQUAL_UINT(previousLast + 1, waiting[i].firstRow);
+    previousLast = waiting[i].lastRow;
+    TEST_ASSERT_TRUE(waiting[i].rows > 0);
+  }
+}
+
+static void test_every_segment_is_a_valid_csv_with_a_matching_checksum() {
+  Rig rig;
+  TEST_ASSERT_TRUE(rig.logStore.begin().ok());
+  KeyString id;
+  TEST_ASSERT_TRUE(rig.logStore
+                       .openSession(m15::continuousSpec(LogStore::kMinSegmentBytes),
+                                    m15::kColumns, 2, id)
+                       .ok());
+  std::uint32_t row = 1;
+  for (int i = 0; i < 40; ++i) {
+    const std::string text = m15::makeRows(row, 40);
+    TEST_ASSERT_TRUE(rig.logStore.appendRows(m15::batchOf(text, row, 40)).ok());
+    row += 40;
+  }
+
+  LogStore::SegmentInfo segment;
+  TEST_ASSERT_TRUE(rig.logStore.segmentInfo(id.c_str(), 1, segment));
+  const std::string file = m15::readFile(rig.backend, segment.path.c_str());
+
+  // A part is a whole CSV on its own: a reader who receives only this file must
+  // be able to use it.
+  TEST_ASSERT_TRUE(file.find("# dataset: ") != std::string::npos);
+  TEST_ASSERT_TRUE(file.find("# segment: 1\n") != std::string::npos);
+  TEST_ASSERT_TRUE(file.find("# mode: continuous_offload\n") != std::string::npos);
+  TEST_ASSERT_TRUE(file.find("# first_global_row: 1\n") != std::string::npos);
+  TEST_ASSERT_TRUE(file.find("t_ms,epoch_ms,global_row,") != std::string::npos);
+  TEST_ASSERT_TRUE(file.find("# segment_complete\n") != std::string::npos);
+  TEST_ASSERT_TRUE(file.find("# payload_crc32: ") != std::string::npos);
+
+  // The checksum in the footer describes the rows, and nothing else.
+  const std::string payload = m15::payloadOf(file);
+  TEST_ASSERT_TRUE(!payload.empty());
+  TEST_ASSERT_EQUAL_UINT(crc32(payload.data(), payload.size()), segment.payloadCrc32);
+  TEST_ASSERT_EQUAL_UINT(payload.size(), file.find("# segment_complete")
+                                             - (file.find("quality_mask\n")
+                                                + std::strlen("quality_mask\n")));
+}
+
+static void test_only_a_proved_ack_deletes_a_segment() {
+  Rig rig;
+  TEST_ASSERT_TRUE(rig.logStore.begin().ok());
+  KeyString id;
+  TEST_ASSERT_TRUE(rig.logStore
+                       .openSession(m15::continuousSpec(LogStore::kMinSegmentBytes),
+                                    m15::kColumns, 2, id)
+                       .ok());
+  std::uint32_t row = 1;
+  for (int i = 0; i < 40; ++i) {
+    const std::string text = m15::makeRows(row, 40);
+    rig.logStore.appendRows(m15::batchOf(text, row, 40));
+    row += 40;
+  }
+  LogStore::SegmentInfo segment;
+  TEST_ASSERT_TRUE(rig.logStore.segmentInfo(id.c_str(), 1, segment));
+  TEST_ASSERT_TRUE(rig.backend.exists(segment.path.c_str()));
+
+  bool already = false;
+  // Wrong size: the transfer was short, whatever the client believes.
+  TEST_ASSERT_FALSE(rig.logStore
+                        .acknowledgeSegment(id.c_str(), 1, "browser-01",
+                                            segment.bytes - 1,
+                                            segment.payloadCrc32, already)
+                        .ok());
+  TEST_ASSERT_TRUE(rig.backend.exists(segment.path.c_str()));
+
+  // Wrong checksum: the bytes arrived, and they are not the same bytes.
+  TEST_ASSERT_FALSE(rig.logStore
+                        .acknowledgeSegment(id.c_str(), 1, "browser-01",
+                                            segment.bytes,
+                                            segment.payloadCrc32 ^ 1u, already)
+                        .ok());
+  TEST_ASSERT_TRUE(rig.backend.exists(segment.path.c_str()));
+
+  // A different tab: it may be looking at the same rig, but it does not hold
+  // this file, and its word is not the owner's.
+  TEST_ASSERT_FALSE(rig.logStore
+                        .acknowledgeSegment(id.c_str(), 1, "browser-02",
+                                            segment.bytes,
+                                            segment.payloadCrc32, already)
+                        .ok());
+  TEST_ASSERT_TRUE(rig.backend.exists(segment.path.c_str()));
+
+  // The real thing.
+  TEST_ASSERT_TRUE(rig.logStore
+                       .acknowledgeSegment(id.c_str(), 1, "browser-01",
+                                           segment.bytes, segment.payloadCrc32,
+                                           already)
+                       .ok());
+  TEST_ASSERT_FALSE(already);
+  TEST_ASSERT_FALSE(rig.backend.exists(segment.path.c_str()));
+
+  // And a repeat, because the answer to the first one can be lost on the way
+  // back.  Idempotent, not an error, and it does not delete anything else.
+  TEST_ASSERT_TRUE(rig.logStore
+                       .acknowledgeSegment(id.c_str(), 1, "browser-01",
+                                           segment.bytes, segment.payloadCrc32,
+                                           already)
+                       .ok());
+  TEST_ASSERT_TRUE(already);
+
+  // The part still being written has no footer and no final checksum, so it is
+  // not offered and cannot be acknowledged away.
+  LogStore::SegmentInfo active;
+  const std::uint32_t writing = 99;
+  TEST_ASSERT_FALSE(rig.logStore.segmentInfo(id.c_str(), writing, active));
+  TEST_ASSERT_FALSE(rig.logStore
+                        .acknowledgeSegment(id.c_str(), writing, "browser-01", 1, 1,
+                                            already)
+                        .ok());
+}
+
+static void test_an_interrupted_session_comes_back_as_incomplete_not_lost() {
+  std::string root;
+  KeyString id;
+  {
+    Rig first;
+    root = first.root;
+    first.keepFiles = true;
+    TEST_ASSERT_TRUE(first.logStore.begin().ok());
+    TEST_ASSERT_TRUE(first.logStore
+                         .openSession(m15::continuousSpec(LogStore::kMinSegmentBytes),
+                                      m15::kColumns, 2, id)
+                         .ok());
+    std::uint32_t row = 1;
+    for (int i = 0; i < 40; ++i) {
+      const std::string text = m15::makeRows(row, 40);
+      first.logStore.appendRows(m15::batchOf(text, row, 40));
+      row += 40;
+    }
+    // No stop(), no closeSession(): the power went.
+  }
+
+  Rig second(root, false);
+  TEST_ASSERT_TRUE(second.logStore.begin().ok());
+
+  JsonDocument index;
+  TEST_ASSERT_TRUE(second.logStore.loadIndex(index).ok());
+  bool found = false;
+  for (JsonObjectConst entry : index["logs"].as<JsonArrayConst>()) {
+    if (std::strcmp(entry["id"] | "", id.c_str()) != 0) continue;
+    found = true;
+    // Not COMPLETE, and not silently gone.
+    TEST_ASSERT_EQUAL_STRING("INTERRUPTED", entry["state"] | "");
+    TEST_ASSERT_TRUE(entry["truncated"] | false);
+  }
+  TEST_ASSERT_TRUE(found);
+
+  LogStore::SegmentInfo waiting[LogStore::kMaxPendingSegments];
+  const std::size_t count =
+      second.logStore.listSegments(id.c_str(), waiting, LogStore::kMaxPendingSegments);
+  TEST_ASSERT_TRUE(count >= 1);
+  // The parts that were finished before the cut are still whole and still
+  // collectable; the one that was open says what happened to it.
+  bool sawRecovered = false;
+  for (std::size_t i = 0; i < count; ++i) {
+    TEST_ASSERT_TRUE(second.backend.exists(waiting[i].path.c_str()));
+    if (waiting[i].state.equals("RECOVERED_TRUNCATED")) sawRecovered = true;
+  }
+  TEST_ASSERT_TRUE(sawRecovered);
+}
+
+static void test_a_queue_nobody_collects_stops_the_log_and_keeps_the_data() {
+  Rig rig;
+  TEST_ASSERT_TRUE(rig.logStore.begin().ok());
+  KeyString id;
+  TEST_ASSERT_TRUE(rig.logStore
+                       .openSession(m15::continuousSpec(LogStore::kMinSegmentBytes),
+                                    m15::kColumns, 2, id)
+                       .ok());
+
+  // Nothing acknowledges, so the queue fills.  The append that cannot be
+  // queued fails — it does not overwrite, and it does not drop the oldest part.
+  Status last = ok();
+  std::uint32_t row = 1;
+  for (int i = 0; i < 4000 && last.ok(); ++i) {
+    const std::string text = m15::makeRows(row, 40);
+    last = rig.logStore.appendRows(m15::batchOf(text, row, 40));
+    row += 40;
+  }
+  TEST_ASSERT_FALSE(last.ok());
+  TEST_ASSERT_EQUAL_INT(static_cast<int>(ErrorCode::kOutOfCapacity),
+                        static_cast<int>(last.code));
+
+  LogStore::SegmentInfo waiting[LogStore::kMaxPendingSegments];
+  const std::size_t count =
+      rig.logStore.listSegments(id.c_str(), waiting, LogStore::kMaxPendingSegments);
+  TEST_ASSERT_EQUAL_UINT(LogStore::kMaxPendingSegments, count);
+  // Every queued part is still on disk.  The failure mode this refuses is a
+  // logger that keeps running by throwing away yesterday's measurements.
+  for (std::size_t i = 0; i < count; ++i) {
+    TEST_ASSERT_TRUE(rig.backend.exists(waiting[i].path.c_str()));
+  }
+}
+
+static void test_single_mode_is_exactly_what_it_was() {
+  Rig rig;
+  TEST_ASSERT_TRUE(rig.logStore.begin().ok());
+
+  LogSpec spec;
+  spec.name.assign("ordinary");
+  spec.rateHz = 1.0f;
+  spec.channelCount = 2;
+  // No storage_mode, no collector: an old client, unchanged.
+  KeyString id;
+  TEST_ASSERT_TRUE(rig.logStore.openSession(spec, m15::kColumns, 2, id).ok());
+
+  const std::string text = m15::makeRows(1, 10);
+  TEST_ASSERT_TRUE(rig.logStore.appendRows(m15::batchOf(text, 1, 10)).ok());
+
+  LogStatus status;
+  status.id = id;
+  status.rows = 10;
+  status.rateHz = 1.0f;
+  rig.logStore.closeSession(status);
+
+  FixedString<64> path;
+  TEST_ASSERT_TRUE(rig.logStore.pathFor(id.c_str(), path));
+  const std::string file = m15::readFile(rig.backend, path.c_str());
+  // One file, the old name, the old footer, and no global_row column.
+  TEST_ASSERT_TRUE(path.equals("/data/logs/log_0001.csv"));
+  TEST_ASSERT_TRUE(file.find("t_ms,epoch_ms,bath.degC") != std::string::npos);
+  TEST_ASSERT_TRUE(file.find("# complete\n") != std::string::npos);
+  TEST_ASSERT_TRUE(file.find("# segment:") == std::string::npos);
+  // And it produces no queue at all.
+  LogStore::SegmentInfo waiting[LogStore::kMaxPendingSegments];
+  TEST_ASSERT_EQUAL_UINT(
+      0, rig.logStore.listSegments(id.c_str(), waiting, LogStore::kMaxPendingSegments));
+}
+
+static void test_the_index_does_not_grow_with_the_length_of_the_run() {
+  Rig rig;
+  TEST_ASSERT_TRUE(rig.logStore.begin().ok());
+  KeyString id;
+  TEST_ASSERT_TRUE(rig.logStore
+                       .openSession(m15::continuousSpec(LogStore::kMinSegmentBytes),
+                                    m15::kColumns, 2, id)
+                       .ok());
+
+  std::size_t firstSize = 0;
+  std::uint32_t row = 1;
+  std::uint32_t nextAck = 1;
+  // Twelve parts produced and collected — more than the queue can hold at once,
+  // which is the point: the index must describe the QUEUE, not the history.
+  for (int i = 0; i < 400; ++i) {
+    const std::string text = m15::makeRows(row, 40);
+    if (!rig.logStore.appendRows(m15::batchOf(text, row, 40)).ok()) break;
+    row += 40;
+    LogStore::SegmentInfo segment;
+    while (rig.logStore.segmentInfo(id.c_str(), nextAck, segment)) {
+      bool already = false;
+      TEST_ASSERT_TRUE(rig.logStore
+                           .acknowledgeSegment(id.c_str(), nextAck, "browser-01",
+                                               segment.bytes, segment.payloadCrc32,
+                                               already)
+                           .ok());
+      ++nextAck;
+      if (firstSize == 0) {
+        firstSize = rig.backend.size(LogStore::kIndexPath).value();
+      }
+    }
+  }
+  TEST_ASSERT_TRUE(nextAck > 6);
+  const std::size_t finalSize = rig.backend.size(LogStore::kIndexPath).value();
+  // Bounded, not merely "not enormous": every acknowledged part leaves the
+  // index, so its size follows the queue depth and nothing else.
+  TEST_ASSERT_TRUE(finalSize < firstSize + 512);
+  TEST_ASSERT_TRUE(finalSize < LogStore::kMaxIndexBytes);
+}
+
 int main(int, char**) {
   UNITY_BEGIN();
   RUN_TEST(test_save_and_load_round_trip);
@@ -662,5 +1044,12 @@ int main(int, char**) {
   RUN_TEST(test_control_serialisation_round_trips);
   RUN_TEST(test_a_run_interrupted_by_a_reboot_comes_back_as_aborted);
   RUN_TEST(test_the_run_log_keeps_the_newest_records_and_drops_the_oldest);
+  RUN_TEST(test_a_continuous_session_rotates_at_its_segment_limit);
+  RUN_TEST(test_every_segment_is_a_valid_csv_with_a_matching_checksum);
+  RUN_TEST(test_only_a_proved_ack_deletes_a_segment);
+  RUN_TEST(test_an_interrupted_session_comes_back_as_incomplete_not_lost);
+  RUN_TEST(test_a_queue_nobody_collects_stops_the_log_and_keeps_the_data);
+  RUN_TEST(test_single_mode_is_exactly_what_it_was);
+  RUN_TEST(test_the_index_does_not_grow_with_the_length_of_the_run);
   return UNITY_END();
 }

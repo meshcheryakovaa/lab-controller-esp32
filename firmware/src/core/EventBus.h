@@ -44,6 +44,10 @@ enum class EventType : std::uint8_t {
   kProfileActivated,
   kLoggingStarted,
   kLoggingStopped,
+  // M15: a log segment has been closed and is waiting to be collected.  Only a
+  // nudge — the client re-reads the queue over REST regardless, so a dropped
+  // frame delays a transfer and can never lose one.
+  kLogSegmentReady,
   kSystemMessage,
 
   kCount  // keep last; must stay <= 32 (mask is a uint32)

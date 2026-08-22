@@ -93,6 +93,23 @@ export class LocalHistoryDb {
         if (!db.objectStoreNames.contains('settings')) {
           db.createObjectStore('settings', { keyPath: ['controllerId', 'dashboardKey'] });
         }
+        // M15's stores are created here as well.  Whichever module opens the
+        // database first performs the upgrade, and the other must find every
+        // store already present — see DB_VERSION.
+        if (!db.objectStoreNames.contains('espLogSessions')) {
+          const store = db.createObjectStore('espLogSessions', { keyPath: 'key' });
+          store.createIndex('controller', ['controllerId', 'sessionId']);
+        }
+        if (!db.objectStoreNames.contains('espLogSegments')) {
+          const store = db.createObjectStore('espLogSegments', { keyPath: 'key' });
+          store.createIndex('session', ['controllerId', 'sessionId']);
+          store.createIndex('sequence', ['controllerId', 'sessionId', 'sequence']);
+          store.createIndex('acknowledged', ['sessionId', 'acknowledgedEpochMs']);
+        }
+        if (!db.objectStoreNames.contains('espLogEvents')) {
+          const store = db.createObjectStore('espLogEvents', { keyPath: 'key' });
+          store.createIndex('session', ['controllerId', 'sessionId']);
+        }
       };
       request.onsuccess = () => resolve(new LocalHistoryDb(request.result));
       request.onerror = () => reject(request.error ?? new Error('cannot open the local archive'));

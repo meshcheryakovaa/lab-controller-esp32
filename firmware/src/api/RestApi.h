@@ -94,6 +94,8 @@ class RestApi {
   void handleExperiments(const ApiRequest&, const PathSegments&, ApiResponse&);
   void handleLogs(const ApiRequest&, const PathSegments&, ApiResponse&);
   void describeLogging(JsonObject out) const;
+  // M15: the offload queue of one continuous session.
+  void describeSegments(const char* id, ApiResponse& response);
   void handleAuth(const ApiRequest&, const PathSegments&, ApiResponse&);
   void handleFirmware(const ApiRequest&, const PathSegments&, ApiResponse&);
   void handleConfig(const ApiRequest&, const PathSegments&, ApiResponse&);

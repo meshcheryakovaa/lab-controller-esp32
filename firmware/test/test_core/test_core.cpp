@@ -4,6 +4,10 @@
 // =============================================================================
 #include <unity.h>
 
+#include <cstring>
+
+#include "core/Crc32.h"
+
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -442,6 +446,35 @@ static void test_the_static_footprint_stays_within_budget() {
   TEST_ASSERT_TRUE(total > 0);
 }
 
+
+// Milestone 15: this checksum is what authorises the controller to delete a
+// CSV, so the browser's implementation and this one must agree exactly.  The
+// vectors below are the same ones frontend/src/lib/log-offload/log-offload.test
+// asserts — two implementations that agree only by assertion are how a
+// corrupted transfer ends with a deleted original.
+static void test_crc32_matches_the_vectors_the_browser_uses() {
+  TEST_ASSERT_EQUAL_HEX32(0x00000000u, crc32("", 0));
+  TEST_ASSERT_EQUAL_HEX32(0xe8b7be43u, crc32("a", 1));
+  TEST_ASSERT_EQUAL_HEX32(0xcbf43926u, crc32("123456789", 9));
+  const char* fox = "The quick brown fox jumps over the lazy dog";
+  TEST_ASSERT_EQUAL_HEX32(0x414fa339u, crc32(fox, std::strlen(fox)));
+
+  // Fed in pieces, it must give the same answer as one pass: a segment is
+  // checksummed as it is written, 4 KiB at a time.
+  Crc32 running;
+  running.update("1234", 4);
+  running.update("56789", 5);
+  TEST_ASSERT_EQUAL_HEX32(0xcbf43926u, running.value());
+
+  // And reading the running total does not end it.
+  Crc32 partial;
+  partial.update("123", 3);
+  const std::uint32_t peek = partial.value();
+  partial.update("456789", 6);
+  TEST_ASSERT_EQUAL_HEX32(0xcbf43926u, partial.value());
+  TEST_ASSERT_TRUE(peek != partial.value());
+}
+
 int main(int, char**) {
   UNITY_BEGIN();
   RUN_TEST(test_the_static_footprint_stays_within_budget);
@@ -460,5 +493,6 @@ int main(int, char**) {
   RUN_TEST(test_resource_manager_releases_everything_a_device_owned);
   RUN_TEST(test_resource_manager_detects_i2c_address_collisions);
   RUN_TEST(test_module_registry_rejects_duplicates);
+  RUN_TEST(test_crc32_matches_the_vectors_the_browser_uses);
   return UNITY_END();
 }

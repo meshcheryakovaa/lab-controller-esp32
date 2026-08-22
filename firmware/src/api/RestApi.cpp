@@ -1,5 +1,6 @@
 #include "api/RestApi.h"
 
+#include <cstdlib>
 #include <cstring>
 
 #include "buses/I2cScanner.h"
@@ -2344,6 +2345,68 @@ void RestApi::describeLogging(JsonObject out) const {
   }
 }
 
+/**
+ * The offload queue of one session (M15 §14.2).
+ *
+ * REST is the source of truth here and the WebSocket event is only a nudge: a
+ * collector that missed a notification must be able to rebuild its whole to-do
+ * list from this one response, or a lost frame would become a lost segment.
+ */
+void RestApi::describeSegments(const char* id, ApiResponse& response) {
+  JsonDocument index;
+  if (!s_.logStore->loadIndex(index).ok()) {
+    response.setError(fail(ErrorCode::kStorageFailure, "log index"));
+    return;
+  }
+  for (JsonObjectConst entry : index["logs"].as<JsonArrayConst>()) {
+    if (std::strcmp(entry["id"] | "", id) != 0) continue;
+
+    JsonObject out = response.body.to<JsonObject>();
+    out["session_id"] = jsonCopy(id);
+    out["state"] = jsonCopy(entry["state"] | "");
+    out["mode"] = jsonCopy(entry["mode"] | "single");
+    out["collector_id"] = jsonCopy(entry["collector_id"] | "");
+    out["segments_completed"] = entry["segments_completed"] | 0u;
+    out["segments_acked"] = entry["segments_acked"] | 0u;
+    out["acked_through"] = entry["acked_through"] | 0u;
+    out["rows"] = entry["rows"] | 0u;
+    out["dropped"] = entry["dropped"] | 0u;
+    JsonObjectConst active = entry["active"].as<JsonObjectConst>();
+    if (!active.isNull()) {
+      out["active_segment"] = active["sequence"] | 0u;
+      out["active_bytes"] = active["bytes"] | 0u;
+    }
+    out["segment_bytes"] = entry["segment_bytes"] | LogStore::kDefaultSegmentBytes;
+
+    std::size_t pendingBytes = 0;
+    JsonArray pending = out["pending"].to<JsonArray>();
+    LogStore::SegmentInfo waiting[LogStore::kMaxPendingSegments];
+    const std::size_t count =
+        s_.logStore->listSegments(id, waiting, LogStore::kMaxPendingSegments);
+    for (std::size_t i = 0; i < count; ++i) {
+      JsonObject item = pending.add<JsonObject>();
+      item["sequence"] = waiting[i].sequence;
+      item["bytes"] = waiting[i].bytes;
+      item["rows"] = waiting[i].rows;
+      item["first_row"] = waiting[i].firstRow;
+      item["last_row"] = waiting[i].lastRow;
+      char crc[16];
+      std::snprintf(crc, sizeof(crc), "%08x",
+                    static_cast<unsigned>(waiting[i].payloadCrc32));
+      item["payload_crc32"] = jsonCopy(crc);
+      item["state"] = jsonCopy(waiting[i].state.c_str());
+      pendingBytes += waiting[i].bytes;
+    }
+    out["pending_bytes"] = pendingBytes;
+    // How much room the queue still has.  The interface turns this into the
+    // warning that tells an operator to reconnect the collector BEFORE the log
+    // has to stop (§21).
+    out["writable_bytes"] = s_.logStore->writableBytes();
+    return;
+  }
+  response.setError(404, fail(ErrorCode::kNotFound, id));
+}
+
 void RestApi::handleLogs(const ApiRequest& request, const PathSegments& path,
                          ApiResponse& response) {
   if (s_.logger == nullptr || s_.logStore == nullptr) {
@@ -2369,6 +2432,25 @@ void RestApi::handleLogs(const ApiRequest& request, const PathSegments& path,
     spec.sample.assign(body["sample"] | "");
     spec.rateHz = body["rate_hz"] | 1.0f;
     spec.includeRaw = body["raw"] | true;
+    // M15.  Absent means `single`, which is what every existing client sends
+    // and what every existing session behaves like.
+    if (!parseStorageMode(body["storage_mode"] | "", spec.storageMode)) {
+      response.setError(fail(ErrorCode::kInvalidArgument,
+                             "storage_mode is single or continuous_offload"),
+                        "storage_mode");
+      return;
+    }
+    spec.segmentBytes = body["segment_bytes"] | 0u;
+    spec.collectorId.assign(body["collector_id"] | "");
+    if (spec.storageMode == LogStorageMode::kContinuousOffload
+        && spec.collectorId.empty()) {
+      // Without an owner nothing may acknowledge, so the segments would queue
+      // until the filesystem filled — a failure it is kinder to refuse now.
+      response.setError(fail(ErrorCode::kInvalidArgument,
+                             "continuous_offload needs a collector_id"),
+                        "collector_id");
+      return;
+    }
     for (JsonVariantConst key : body["channels"].as<JsonArrayConst>()) {
       if (spec.channelCount >= limits::kMaxLoggedChannels) {
         response.setError(fail(ErrorCode::kOutOfCapacity,
@@ -2406,6 +2488,82 @@ void RestApi::handleLogs(const ApiRequest& request, const PathSegments& path,
       return;
     }
     describeLogging(response.body.to<JsonObject>());
+    return;
+  }
+
+  // --- M15: the offload queue ---------------------------------------------
+  // GET /logs/{id}/segments — what is waiting to be collected.
+  if (path.count() == 5 && path.is(4, "segments")) {
+    if (request.method != HttpMethod::kGet) {
+      response.setError(405, fail(ErrorCode::kNotSupported, "use GET"));
+      return;
+    }
+    describeSegments(path.at(3), response);
+    return;
+  }
+
+  // GET /logs/{id}/segments/{n}/export.csv — one part, streamed from the file.
+  if (path.count() >= 7 && path.is(4, "segments") && path.is(6, "export.csv")) {
+    if (request.method != HttpMethod::kGet) {
+      response.setError(405, fail(ErrorCode::kNotSupported, "use GET"));
+      return;
+    }
+    const std::uint32_t sequence =
+        static_cast<std::uint32_t>(std::strtoul(path.at(5), nullptr, 10));
+    LogStore::SegmentInfo segment;
+    if (!s_.logStore->segmentInfo(path.at(3), sequence, segment)) {
+      response.setError(404, fail(ErrorCode::kNotFound, "no such segment"));
+      return;
+    }
+    response.stream.active = true;
+    response.stream.path = segment.path;
+    response.stream.contentType.assign("text/csv");
+    char filename[80];
+    std::snprintf(filename, sizeof(filename), "%s_p%06u.csv", path.at(3),
+                  static_cast<unsigned>(sequence));
+    response.stream.filename.assign(filename);
+    // The checksum travels with the file so a collector can verify without a
+    // second request, and so a proxy cannot serve a stale part as a fresh one.
+    char etag[24];
+    std::snprintf(etag, sizeof(etag), "crc32-%08x",
+                  static_cast<unsigned>(segment.payloadCrc32));
+    response.stream.etag.assign(etag);
+    response.stream.segmentCrc32 = segment.payloadCrc32;
+    response.stream.sequence = sequence;
+    return;
+  }
+
+  // POST /logs/{id}/segments/{n}/ack — the only thing that deletes a segment.
+  if (path.count() >= 7 && path.is(4, "segments") && path.is(6, "ack")) {
+    if (request.method != HttpMethod::kPost) {
+      response.setError(405, fail(ErrorCode::kNotSupported, "use POST"));
+      return;
+    }
+    // Deleting measurements needs the same right as deleting a dataset.
+    if (!requireWriteAccess(request, response)) return;
+    JsonDocument body;
+    if (!parseBody(request, body, response)) return;
+
+    const std::uint32_t sequence =
+        static_cast<std::uint32_t>(std::strtoul(path.at(5), nullptr, 10));
+    const std::uint32_t crc = static_cast<std::uint32_t>(
+        std::strtoul(body["payload_crc32"] | "0", nullptr, 16));
+    bool already = false;
+    const Status acknowledged = s_.logStore->acknowledgeSegment(
+        path.at(3), sequence, body["collector_id"] | "",
+        body["bytes"] | 0u, crc, already);
+    if (!acknowledged.ok()) {
+      response.setError(acknowledged);
+      return;
+    }
+    JsonObject out = response.body.to<JsonObject>();
+    out["acknowledged"] = true;
+    out["deleted"] = true;
+    out["sequence"] = sequence;
+    if (already) out["already_acknowledged"] = true;
+    LogStore::SegmentInfo waiting[LogStore::kMaxPendingSegments];
+    out["pending_segments"] =
+        s_.logStore->listSegments(path.at(3), waiting, LogStore::kMaxPendingSegments);
     return;
   }
 

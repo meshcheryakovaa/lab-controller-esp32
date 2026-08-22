@@ -36,6 +36,7 @@ Status TelemetryBatcher::begin(Scheduler& scheduler, EventBus& events,
                        eventMask(EventType::kAlarmCleared) |
                        eventMask(EventType::kSafetyTripped) |
                        eventMask(EventType::kConfigChanged) |
+                       eventMask(EventType::kLogSegmentReady) |
                        eventMask(EventType::kSystemMessage),
                    eventTrampoline, this);
 
@@ -215,6 +216,11 @@ void TelemetryBatcher::sendEvent(const Event& event) {
     case EventType::kConfigChanged:
       message["type"] = "config";
       message["section"] = (event.detail != nullptr) ? event.detail : "";
+      break;
+
+    case EventType::kLogSegmentReady:
+      message["type"] = "log_segment";
+      message["sequence"] = event.source;
       break;
 
     default:

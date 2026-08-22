@@ -111,6 +111,16 @@ for (const record of stored.calibrations ?? []) {
   if (record.active) await reset.post(`/api/v1/calibrations/${encodeURIComponent(record.id)}/deactivate`, { data: {} });
   await reset.delete(`/api/v1/calibrations/${encodeURIComponent(record.id)}`);
 }
+// Datasets too, and this one bites hardest: the index holds 24 sessions, a
+// continuous run left over from a crashed attempt is still RECORDING, and both
+// make the next run behave differently from the last.  Milestone 15 added the
+// modes; the reset that makes the run repeatable belongs with them.
+await reset.post('/api/v1/logs/stop', { data: {} });
+const datasets = await (await reset.get('/api/v1/logs')).json();
+for (const dataset of datasets.logs ?? []) {
+  await reset.delete(`/api/v1/logs/${encodeURIComponent(dataset.id)}`);
+}
+
 // Dashboards too: the milestone-6 sequence builds one, and it must build it
 // from nothing rather than inherit the previous run's layout.
 const boards = await (await reset.get('/api/v1/dashboards')).json();
@@ -744,6 +754,118 @@ if (restored.trim() !== '10 min') {
 }
 console.log('  the stored chart range survived the reload');
 await shot('52-chart-range-after-reload');
+
+// --- Milestone 15: continuous logging handed to this device ---------------
+// The dangerous operation here is the controller DELETING a CSV on this
+// browser's word, so the scenario follows one all the way through: rotate,
+// download, verify, store, acknowledge, and only then confirm the part is gone
+// from the controller while the rows are still here.
+await nav('Logs').click();
+await page.waitForSelector('.panel');
+await page.waitForTimeout(600);
+
+// Pick the channels and a rate fast enough to fill parts while we watch.
+const logBoxes = page.locator('.check input[type=checkbox]');
+const channelCount = await logBoxes.count();
+for (let i = 0; i < Math.min(3, channelCount); ++i) {
+  if (!(await logBoxes.nth(i).isChecked())) await logBoxes.nth(i).check();
+}
+await page.locator('input[type=number]').first().fill('50');
+await page.locator('input[type=radio][value="continuous_offload"]').check();
+await shot('59-continuous-mode');
+
+// The page has to say what this mode depends on BEFORE it is started.
+const warning = await page.locator('.mode .warn').first().textContent();
+if (!/tab must stay open/i.test(warning ?? '')) {
+  throw new Error(`the continuous mode does not state its dependency: "${warning?.trim()}"`);
+}
+
+await page.locator('.start button.primary').click();
+await page.waitForSelector('.offload', { timeout: 15000 });
+
+// Wait until at least one part has been collected AND acknowledged.
+await page.waitForFunction(() => {
+  const cells = [...document.querySelectorAll('.offload .numeric')];
+  const collected = Number(cells[1]?.textContent?.trim() ?? '0');
+  return collected >= 1;
+}, undefined, { timeout: 90000 });
+await page.waitForTimeout(1500);
+await shot('60-offload-running');
+
+const handover = (await page.locator('.offload').textContent()) ?? '';
+console.log(`  handover: ${handover.replace(/\s+/g, ' ').trim().slice(0, 120)}`);
+
+// What the controller still holds, straight from its own API — the interface
+// is not the thing being trusted here.
+const logApi = await request.newContext({ baseURL: base });
+const running = await (await logApi.get('/api/v1/logs')).json();
+const sessionId = running.recording?.id;
+if (!sessionId) throw new Error('no session is recording');
+const queue = await (await logApi.get(`/api/v1/logs/${sessionId}/segments`)).json();
+if (queue.mode !== 'continuous_offload') {
+  throw new Error(`the session is not continuous: ${queue.mode}`);
+}
+if (!(queue.segments_acked >= 1)) {
+  throw new Error(`nothing was acknowledged: ${JSON.stringify(queue)}`);
+}
+console.log(`  controller: ${queue.segments_completed} parts closed,`
+          + ` ${queue.segments_acked} acknowledged, ${queue.pending.length} waiting`);
+
+// An acknowledged part is gone from the controller.  That is the whole point,
+// and it is only safe because the browser proved it had the bytes first.
+const goneCheck = await logApi.get(`/api/v1/logs/${sessionId}/segments/1/export.csv`);
+if (goneCheck.status() !== 404) {
+  throw new Error(`an acknowledged segment is still downloadable: ${goneCheck.status()}`);
+}
+
+await page.getByRole('button', { name: 'Stop recording' }).click();
+await page.waitForTimeout(3000);
+
+// The local archive: the rows are here even though the controller erased them.
+await page.waitForSelector('table', { timeout: 10000 });
+const localRow = page.locator('section.panel', { hasText: 'Collected on this device' })
+  .locator('tbody tr').first();
+const localText = (await localRow.textContent()) ?? '';
+console.log(`  local archive: ${localText.replace(/\s+/g, ' ').trim().slice(0, 100)}`);
+await shot('61-collected-locally');
+
+// Export the merged CSV and check the two things a merge can get wrong: more
+// than one header, and rows that are not contiguous.
+const mergedDownload = page.waitForEvent('download', { timeout: 30000 });
+await localRow.locator('button', { hasText: 'CSV' }).click();
+const mergedFile = await mergedDownload;
+const mergedText = readFileSync(await mergedFile.path(), 'utf8');
+const headers = mergedText.split('quality_mask\n').length - 1;
+if (headers !== 1) throw new Error(`the merged CSV has ${headers} column lines`);
+if (mergedText.includes('# segment_complete')) {
+  throw new Error('a per-segment footer leaked into the merged rows');
+}
+const globalRows = mergedText.split('\n')
+  .filter((line) => /^\d+,/.test(line))
+  .map((line) => Number(line.split(',')[2]));
+if (globalRows.length < 100) {
+  throw new Error(`the merged CSV has only ${globalRows.length} rows`);
+}
+for (let i = 1; i < globalRows.length; ++i) {
+  if (globalRows[i] !== globalRows[i - 1] + 1) {
+    throw new Error(`global_row jumps from ${globalRows[i - 1]} to ${globalRows[i]}`);
+  }
+}
+console.log(`  merged ${globalRows.length} rows, global_row ${globalRows[0]}`
+          + `..${globalRows[globalRows.length - 1]}, contiguous, one header`);
+
+// And the ZIP, which keeps the parts exactly as the controller wrote them.
+const segmentZipDownload = page.waitForEvent('download', { timeout: 30000 });
+await localRow.locator('button', { hasText: 'ZIP' }).click();
+const segmentZipBytes = readFileSync(await (await segmentZipDownload).path());
+if (segmentZipBytes.readUInt32LE(0) !== 0x04034b50) {
+  throw new Error('the segment ZIP has no local file header');
+}
+if (!segmentZipBytes.includes(Buffer.from('manifest.json'))) {
+  throw new Error('the segment ZIP has no manifest');
+}
+console.log(`  exported a ${segmentZipBytes.length}-byte ZIP with a manifest`);
+await logApi.dispose();
 
 // --- Milestone 14: recording onto this device -----------------------------
 // The acceptance criteria are mostly about honesty under failure, so this

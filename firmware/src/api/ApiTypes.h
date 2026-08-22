@@ -72,6 +72,13 @@ struct StreamSpec {
   FixedString<64> path;              // file on the storage backend
   FixedString<32> contentType{"text/csv"};
   FixedString<64> filename;          // what the browser should call it
+  // --- M15 -------------------------------------------------------------------
+  // A log segment travels with the checksum the receiver will be asked to
+  // prove, so verification costs no second request and a cached copy cannot be
+  // passed off as the current part.
+  FixedString<24> etag;
+  std::uint32_t segmentCrc32 = 0;
+  std::uint32_t sequence = 0;
 };
 
 class ApiResponse {

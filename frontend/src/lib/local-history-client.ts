@@ -108,6 +108,12 @@ export async function readLocalSeries(sessionId: string, channels: string[],
   return readSeries(db, session, channels, from, to, buckets);
 }
 
+/** Text pieces to bytes, without ever concatenating the whole document.  Named
+ *  export because M15's merged CSV goes through the same path. */
+export function toByteStream(pieces: AsyncIterable<string>): ReadableStream<Uint8Array> {
+  return textStream(pieces);
+}
+
 function textStream(pieces: AsyncIterable<string>): ReadableStream<Uint8Array> {
   const encoder = new TextEncoder();
   const iterator = pieces[Symbol.asyncIterator]();

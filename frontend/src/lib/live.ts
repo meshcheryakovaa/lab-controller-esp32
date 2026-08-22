@@ -30,6 +30,8 @@ type StatusListener = (connected: boolean) => void;
 type DeviceListener = (handle: number, state: DeviceState, detail?: string) => void;
 type ConfigListener = (revision: number) => void;
 type AlertListener = (severity: number, code: string, message: string) => void;
+/** M15: a log segment has been closed and is waiting to be collected. */
+type LogSegmentListener = (sequence: number) => void;
 
 /** Passed to config listeners when the firmware said "changed" without saying to what. */
 export const kUnknownRevision = -1;
@@ -45,6 +47,7 @@ export class LiveConnection {
   private deviceListeners = new Set<DeviceListener>();
   private configListeners = new Set<ConfigListener>();
   private alertListeners = new Set<AlertListener>();
+  private logSegmentListeners = new Set<LogSegmentListener>();
   private pending: ChannelFrame | null = null;
   private rafHandle = 0;
   private closedByUser = false;
@@ -148,6 +151,18 @@ export class LiveConnection {
     return () => this.alertListeners.delete(fn);
   }
 
+  /**
+   * A segment is ready for collection (M15 §15).
+   *
+   * Purely an accelerator.  The collector re-reads the queue over REST on a
+   * timer regardless, so a dropped frame delays a transfer and can never lose
+   * one — which is why nothing here needs delivery guarantees.
+   */
+  onLogSegmentReady(fn: LogSegmentListener): () => void {
+    this.logSegmentListeners.add(fn);
+    return () => this.logSegmentListeners.delete(fn);
+  }
+
   get configRevision(): number {
     return this.revision;
   }
@@ -216,6 +231,12 @@ export class LiveConnection {
         // catches up with the firmware's number the "did it change?" test
         // stops firing for good.  kUnknownRevision means "re-read now".
         this.configListeners.forEach((fn) => fn(kUnknownRevision));
+        break;
+      }
+      case 'log_segment': {
+        // No session id: the event says only "a part closed".  The collector
+        // knows which session it owns, and re-reads the queue to find out what.
+        this.logSegmentListeners.forEach((fn) => fn(Number(message.sequence ?? 0)));
         break;
       }
       case 'alarm':

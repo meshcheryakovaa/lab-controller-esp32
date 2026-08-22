@@ -31,6 +31,7 @@
 
 #include <ArduinoJson.h>
 
+#include "core/Crc32.h"
 #include "core/Error.h"
 #include "services/CalibrationManager.h"
 #include "services/DataLogger.h"
@@ -53,6 +54,39 @@ class LogStore final : public ILogSink {
   // ceiling nothing may cross.
   static constexpr std::size_t kMaxSessionBytes = 16 * 1024 * 1024;
 
+  // --- M15: segments ---------------------------------------------------------
+  // A segment is a whole file — header, rows and footer — not a row budget.
+  // 100 KiB is small enough that a browser holds one comfortably and that the
+  // queue on a 640 KiB filesystem is several parts deep, and large enough that
+  // a 2 KiB/s run rotates about once a minute rather than continuously.
+  static constexpr std::size_t kDefaultSegmentBytes = 100 * 1024;
+  static constexpr std::size_t kMinSegmentBytes = 32 * 1024;
+  static constexpr std::size_t kMaxSegmentBytes = 256 * 1024;
+  // Room kept free at the end of every segment so the footer always fits.  A
+  // segment whose footer did not fit would be a file that cannot be verified,
+  // which is the same as a file that cannot be trusted.
+  static constexpr std::size_t kSegmentFooterReserve = 512;
+  // How many finished segments may wait at once.  The filesystem would run out
+  // first on a 4 MB board; this bounds the INDEX, which must not grow with the
+  // length of the run (§33.12).
+  static constexpr std::size_t kMaxPendingSegments = 8;
+  // How far back from the newest segment number listOrphans() looks.  See the
+  // comment on that function: bounded on purpose.
+  static constexpr std::uint32_t kOrphanProbeDepth = 32;
+
+  /** What a waiting segment looks like to the API and to the collector. */
+  struct SegmentInfo {
+    std::uint32_t sequence = 0;
+    std::size_t bytes = 0;
+    std::uint32_t rows = 0;
+    std::uint32_t firstRow = 0;
+    std::uint32_t lastRow = 0;
+    std::uint32_t payloadCrc32 = 0;
+    // READY, or RECOVERED_TRUNCATED for one that a power cut interrupted.
+    FixedString<24> state;
+    FixedString<64> path;
+  };
+
   LogStore(IStorageBackend& backend, ConfigStorage& storage,
            CalibrationManager* calibrations = nullptr)
       : backend_(backend), storage_(storage), calibrations_(calibrations) {}
@@ -62,9 +96,10 @@ class LogStore final : public ILogSink {
   // --- ILogSink ------------------------------------------------------------
   Status openSession(const LogSpec& spec, const char* const* columns,
                      std::size_t columnCount, KeyString& id) override;
-  Status appendRows(const char* text, std::size_t bytes) override;
+  Status appendRows(const LogBatch& batch) override;
   void closeSession(const LogStatus& status) override;
   std::size_t writableBytes() const override;
+  std::uint32_t takeSegmentReadyNotice() override;
 
   // --- the index -----------------------------------------------------------
   Status loadIndex(JsonDocument& out) const;
@@ -76,10 +111,56 @@ class LogStore final : public ILogSink {
 
   std::size_t sessionCount() const;
 
+  // --- M15: the offload queue ------------------------------------------------
+
+  /** Waiting segments of one session, oldest first.  Returns how many were
+   *  written into `out`; `capacity` bounds it. */
+  std::size_t listSegments(const char* id, SegmentInfo* out,
+                           std::size_t capacity) const;
+
+  /** One waiting segment by number.  False when the session or the segment is
+   *  unknown — including a segment that is still being WRITTEN, which must
+   *  never be served: its footer does not exist yet. */
+  bool segmentInfo(const char* id, std::uint32_t sequence, SegmentInfo& out) const;
+
+  /**
+   * Delete a segment because the collector proved it has it.
+   *
+   * Every check here exists because passing it is what authorises a deletion:
+   * the owning collector, the READY state, the exact byte count and the exact
+   * checksum.  A repeat of an ACK that already succeeded is not an error — the
+   * response to the first one may simply have been lost — and sets
+   * `alreadyAcknowledged` instead.
+   */
+  Status acknowledgeSegment(const char* id, std::uint32_t sequence,
+                            const char* collectorId, std::size_t bytes,
+                            std::uint32_t payloadCrc32,
+                            bool& alreadyAcknowledged);
+
+  /** Files under the log directory that no index entry claims.  Never deleted
+   *  automatically — an unexplained file holding measurements is a question for
+   *  the operator, not a tidiness problem. */
+  std::size_t listOrphans(FixedString<64>* out, std::size_t capacity) const;
+
+  /** True while a continuous session is writing segments. */
+  bool rotating() const { return open_ && mode_ == LogStorageMode::kContinuousOffload; }
+
  private:
   Status saveIndex(JsonDocument& document);
   Status writeHeader(const LogSpec& spec, const char* const* columns,
                      std::size_t columnCount);
+  // --- M15 -------------------------------------------------------------------
+  void segmentPath(std::uint32_t sequence, FixedString<64>& out) const;
+  Status openSegment(std::uint32_t sequence);
+  Status ensureSegmentHeader(std::uint32_t firstGlobalRow);
+  // `nextSequence` is the part that will be opened straight afterwards, or 0
+  // when the session is ending.  Passed through so that closing one part and
+  // claiming the next happen in a single index write.
+  Status finalizeSegment(bool truncated, std::uint32_t nextSequence);
+  Status recordSegmentInIndex(bool truncated, std::uint32_t nextSequence);
+  Status refreshActiveInIndex();
+  Status recoverSessions();
+  static void describeSegment(JsonObjectConst entry, SegmentInfo& out);
 
   IStorageBackend& backend_;
   ConfigStorage& storage_;
@@ -88,6 +169,37 @@ class LogStore final : public ILogSink {
   FixedString<64> currentPath_;
   KeyString currentId_;
   bool open_ = false;
+
+  // --- M15: the active segment ----------------------------------------------
+  LogStorageMode mode_ = LogStorageMode::kSingle;
+  std::size_t segmentLimit_ = kDefaultSegmentBytes;
+  std::uint32_t sequence_ = 0;
+  std::size_t segmentBytes_ = 0;      // whole file, header included
+  std::size_t payloadBytes_ = 0;      // data rows only — what the CRC covers
+  std::uint32_t segmentRows_ = 0;
+  std::uint32_t segmentFirstRow_ = 0;
+  std::uint32_t segmentLastRow_ = 0;
+  std::uint32_t previousSegment_ = 0;
+  Crc32 payloadCrc_;
+  KeyString collectorId_;
+  // The header is rewritten for every segment, so what it is built from has to
+  // outlive the call that started the session.
+  LogSpec spec_;
+  char columnLine_[640] = {0};
+  // Writing the active size into the index on every flush would be a flash
+  // write every half second for the length of the run (§22).  Throttled by
+  // BYTES rather than by time so that no clock is needed here and the cost is
+  // proportional to the data actually produced.
+  static constexpr std::size_t kActiveSaveEveryBytes = 32 * 1024;
+  std::size_t lastActiveSaveBytes_ = 0;
+  bool headerWritten_ = false;
+  // The session-wide dropped count as of the last batch, so a segment footer
+  // can state it without the store having to count rows itself.
+  std::uint32_t droppedAtSegmentEnd_ = 0;
+  // Rises once per finished segment, read by the logger, which owns the event
+  // bus.  The same pattern as takeTruncationNotice(): the store reports facts,
+  // the service publishes them.
+  std::uint32_t segmentReadyNotice_ = 0;
 };
 
 }  // namespace lc

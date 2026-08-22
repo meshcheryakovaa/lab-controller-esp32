@@ -421,6 +421,19 @@ export interface LogEntry {
   config_fingerprint?: number;
   firmware?: string;
   error?: { code: string; detail?: string };
+  // --- Milestone 15 ---------------------------------------------------------
+  /** Absent on every dataset written before M15, and read as `single`. */
+  mode?: 'single' | 'continuous_offload';
+  collector_id?: string;
+  segment_bytes?: number;
+  segments_completed?: number;
+  segments_acked?: number;
+  acked_through?: number;
+  /** Present only while a continuous session is writing. */
+  active?: { sequence: number; path: string; bytes: number; rows: number };
+  pending?: Array<{ sequence: number; bytes: number; rows: number;
+                    first_row: number; last_row: number;
+                    payload_crc32: string; state: string }>;
 }
 
 export interface LoggingStatus {

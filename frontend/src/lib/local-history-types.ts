@@ -23,7 +23,18 @@
 import type { ChannelQuality } from './types';
 
 export const DB_NAME = 'lab-controller-local-history-v1';
-export const DB_VERSION = 1;
+/**
+ * ONE version for the whole database, shared by every module that opens it.
+ *
+ * M14's recordings and M15's offloaded segments live in the same IndexedDB with
+ * different object stores, and IndexedDB allows exactly one version per
+ * database.  Opening it at 1 from one module and 2 from another does not
+ * produce an error — the lower-version open holds a connection that BLOCKS the
+ * upgrade, and the second open never settles at all.  A hang with nothing in
+ * the console is a bad way to find that out, so the number lives here and both
+ * upgrade handlers create every store.
+ */
+export const DB_VERSION = 2;
 
 // --- chunking ----------------------------------------------------------------
 //  One IndexedDB transaction per WebSocket frame would be thousands of tiny

@@ -9,6 +9,7 @@
 //      the form validates is exactly what the create will do.
 // =============================================================================
 
+import type { SegmentQueue } from './log-offload/SegmentCollector';
 import type {
   ApiError, AuthStatus, Calibration, CalibrationFit, CalibrationKind,
   CalibrationResidual,
@@ -302,7 +303,12 @@ export const api = {
   log: (id: string) => request<LogEntry>('GET', `/logs/${encodeURIComponent(id)}`),
   startLog: (spec: { name: string; operator?: string; sample?: string;
                      rate_hz: number; raw?: boolean; channels: string[];
-                     expected_s?: number }) =>
+                     expected_s?: number;
+                     // M15.  Absent means `single` — the mode every session had
+                     // before, and the one an old client still gets.
+                     storage_mode?: 'single' | 'continuous_offload';
+                     segment_bytes?: number;
+                     collector_id?: string }) =>
     request<LoggingStatus>('POST', '/logs/start', spec),
   stopLog: () => request<LoggingStatus>('POST', '/logs/stop', {}),
   deleteLog: (id: string) =>
@@ -310,6 +316,34 @@ export const api = {
   /** Not fetched: handed to the browser, which streams it to disk.  A dataset
       is megabytes and does not belong in a JavaScript string (ADR-0019). */
   logDownloadUrl: (id: string) => `${BASE}/logs/${encodeURIComponent(id)}/export.csv`,
+
+  // --- the offload queue (Milestone 15) -------------------------------------
+  /** What is waiting on the controller.  REST is the source of truth here: a
+      collector that missed a WebSocket notification rebuilds its whole to-do
+      list from this, so a lost frame can never become a lost segment. */
+  logSegments: (id: string) =>
+    request<SegmentQueue>('GET', `/logs/${encodeURIComponent(id)}/segments`),
+
+  /** One segment, as bytes.  Not `request()`: this is a file, and running it
+      through JSON parsing would both corrupt it and hold it in a string. */
+  downloadLogSegment: async (id: string, sequence: number): Promise<Uint8Array> => {
+    const response = await fetch(
+      `${BASE}/logs/${encodeURIComponent(id)}/segments/${sequence}/export.csv`,
+      { credentials: 'same-origin', cache: 'no-store' });
+    if (!response.ok) {
+      throw new Error(`segment ${sequence}: HTTP ${response.status}`);
+    }
+    return new Uint8Array(await response.arrayBuffer());
+  },
+
+  /** The call that deletes a CSV from the controller.  Sent only after the
+      segment is verified AND committed to this device's archive. */
+  ackLogSegment: (id: string, sequence: number,
+                  proof: { collector_id: string; bytes: number;
+                           payload_crc32: string }) =>
+    request<{ acknowledged: boolean; deleted: boolean; sequence: number;
+              already_acknowledged?: boolean; pending_segments: number }>(
+      'POST', `/logs/${encodeURIComponent(id)}/segments/${sequence}/ack`, proof),
 
   // --- dashboards (Milestone 6) ---------------------------------------------
   /** Summaries only — eight full layouts do not fit in one response. */

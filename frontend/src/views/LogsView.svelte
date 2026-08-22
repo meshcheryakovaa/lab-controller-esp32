@@ -15,6 +15,10 @@
   // ===========================================================================
   import { onMount } from 'svelte';
   import { api, ApiRequestError } from '../lib/api';
+  import { offload } from '../lib/log-offload/offload.svelte';
+  import { mergedCsv, sessionZip } from '../lib/log-offload/SegmentExport';
+  import type { StoredEspSession } from '../lib/log-offload/SegmentArchive';
+  import { download, toByteStream } from '../lib/local-history-client';
   import { errorSentence } from '../lib/format';
   import { controller, describe } from '../lib/state.svelte';
   import type { LogEntry } from '../lib/types';
@@ -30,6 +34,12 @@
   let name = $state('');
   let operatorName = $state('');
   let sampleName = $state('');
+
+  // M15: where the dataset lives while it is written.  `single` is the default
+  // and the old behaviour; `continuous_offload` turns the controller's flash
+  // into a transfer buffer and this tab into the archive.
+  let storageMode = $state<'single' | 'continuous_offload'>('single');
+  let roomWarning = $state('');
 
   const logging = $derived(controller.logging);
   // `logged` is the descriptor's own answer to "does this belong in a
@@ -70,13 +80,91 @@
   }
 
   function start() {
-    void act(() => api.startLog({
-      name: name || 'manual recording',
-      operator: operatorName,
-      sample: sampleName,
-      rate_hz: rate,
-      channels: selected,
-    }));
+    void act(async () => {
+      if (storageMode === 'continuous_offload') {
+        // A device that cannot hold two parts cannot keep up with a rotation,
+        // and the controller's queue would start filling immediately (§17).
+        if (!offload.available) throw new Error(offload.unavailableReason);
+        if (!(await offload.hasRoom(segmentBytes))) {
+          throw new Error('this device has too little room left to collect '
+                        + 'segments; export and delete a local set first');
+        }
+      }
+      const started = await api.startLog({
+        name: name || 'manual recording',
+        operator: operatorName,
+        sample: sampleName,
+        rate_hz: rate,
+        channels: selected,
+        storage_mode: storageMode,
+        ...(storageMode === 'continuous_offload'
+          ? { segment_bytes: segmentBytes, collector_id: offload.id }
+          : {}),
+      });
+      if (storageMode === 'continuous_offload' && started.id) {
+        await offload.attach(started.id, {
+          name: name || 'manual recording',
+          operator: operatorName,
+          sample: sampleName,
+          rateHz: rate,
+          channels: selected.length,
+          startedEpochMs: Date.now(),
+        });
+      }
+    });
+  }
+
+  /** What the firmware uses when asked for nothing in particular. */
+  const DEFAULT_SEGMENT_BYTES = 100 * 1024;
+  const MIN_SEGMENT_BYTES = 32 * 1024;
+
+
+  const collector = $derived(offload.status);
+
+  /**
+   * What the handover is doing, in words an operator can act on.
+   *
+   * The state machine's WAITING_FOR_DEVICE covers two very different
+   * situations — "nothing to collect right now" and "the controller stopped
+   * answering" — and showing the raw name made the ordinary one look like a
+   * fault.
+   */
+  const handoverPhrase = $derived.by(() => {
+    switch (collector.state) {
+      case 'WAITING_FOR_DEVICE':
+        return collector.attempts > 0 ? 'no answer from the controller'
+                                      : 'up to date';
+      case 'RECEIVING': return 'receiving a part';
+      case 'VERIFYING': return 'checking a part';
+      case 'SAVING': return 'saving to this device';
+      case 'ACKNOWLEDGING': return 'confirming to the controller';
+      case 'LOCAL_STORAGE_FULL': return 'this device is full';
+      case 'COMPLETE': return 'everything has been handed over';
+      case 'ERROR': return 'stopped after an error';
+      default: return collector.state.replace(/_/g, ' ').toLowerCase();
+    }
+  });
+  const collecting = $derived(
+    collector.sessionId !== '' && collector.state !== 'IDLE');
+  // How long the controller could keep recording with nobody collecting.
+  const queueHeadroom = $derived(
+    collector.segmentBytes > 0
+      ? Math.floor(collector.writableBytes / collector.segmentBytes)
+      : 0);
+
+  async function exportMerged(session: StoredEspSession) {
+    await act(async () => {
+      const report = { segments: 0, rows: 0, missing: [] as number[], complete: false };
+      await download(toByteStream(mergedCsv(offload.store!, session, report)),
+                     `${session.sessionId}.csv`, 'text/csv');
+    });
+  }
+
+  async function exportZip(session: StoredEspSession) {
+    await act(async () => {
+      await download(await sessionZip(offload.store!, session),
+                     `${session.sessionId}.zip`, 'application/zip');
+    });
   }
 
   function toggle(key: string) {
@@ -100,6 +188,24 @@
   const writable = $derived(logging?.writable_bytes ?? 0);
   const reserve = $derived(logging?.reserve_bytes ?? 0);
   const low = $derived(writable > 0 && writable < 128 * 1024);
+
+  /**
+   * How big one part should be on THIS controller right now.
+   *
+   * Continuous mode needs room for the part being written plus one waiting to
+   * be collected, and on a filesystem that already holds a configuration, a few
+   * dashboards and a scenario, 200 KB free is not a given.  Refusing outright
+   * would be correct and useless; sizing the parts to the room that exists is
+   * correct and usable.  The floor is the firmware's own minimum — below that
+   * the rotation costs more in flash writes than it saves.
+   */
+  const segmentBytes = $derived.by(() => {
+    const half = Math.floor(writable / 2 / 4096) * 4096;
+    if (half >= DEFAULT_SEGMENT_BYTES) return DEFAULT_SEGMENT_BYTES;
+    return Math.max(MIN_SEGMENT_BYTES, half);
+  });
+  const continuousFits = $derived(writable >= MIN_SEGMENT_BYTES * 2);
+
 </script>
 
 <div class="page">
@@ -149,6 +255,48 @@
         <button type="button" class="danger" disabled={busy}
                 onclick={() => act(() => api.stopLog())}>Stop recording</button>
       </div>
+
+      {#if collecting}
+        <div class="offload" class:bad-banner={collector.state === 'ERROR'
+                                            || collector.state === 'LOCAL_STORAGE_FULL'}>
+          <div>
+            <span class="label">handover</span>
+            <strong>{handoverPhrase}</strong>
+            {#if offload.ownedElsewhere}
+              <span class="warn small">— another tab is collecting this session</span>
+            {/if}
+          </div>
+          <div>
+            <span class="label">current part</span>
+            <span class="numeric">{collector.activeSegment}</span>
+            <span class="muted small">{size(collector.activeBytes)} / {size(collector.segmentBytes)}</span>
+          </div>
+          <div>
+            <span class="label">on this device</span>
+            <span class="numeric">{collector.collected}</span>
+            <span class="muted small">parts · {size(collector.collectedBytes)}</span>
+          </div>
+          <div>
+            <span class="label">waiting on the controller</span>
+            <span class="numeric" class:warn={collector.pending > 1}>{collector.pending}</span>
+            <span class="muted small">{size(collector.pendingBytes)}</span>
+          </div>
+          {#if collector.state === 'WAITING_FOR_DEVICE' && collector.attempts > 0}
+            <p class="small warn">
+              No answer from the controller. It keeps recording; room for about
+              {queueHeadroom} more part{queueHeadroom === 1 ? '' : 's'} before the
+              log has to stop. Nothing queued is deleted.
+            </p>
+          {:else if collector.state === 'LOCAL_STORAGE_FULL'}
+            <p class="small bad">
+              This device is full, so nothing is being acknowledged and the
+              controller still holds every part. Export and delete a local set.
+            </p>
+          {:else if collector.state === 'ERROR'}
+            <p class="small bad">{collector.lastError}</p>
+          {/if}
+        </div>
+      {/if}
     {:else}
       <div class="start">
         <label>name<input bind:value={name} placeholder="what this is" /></label>
@@ -157,6 +305,44 @@
         <label>rate (Hz)
           <input type="number" min="0.1" max={limits.rate_hz} step="0.1" bind:value={rate} />
         </label>
+        <fieldset class="mode">
+          <legend class="label">storage</legend>
+          <label class="radio">
+            <input type="radio" name="storage" value="single"
+                   checked={storageMode === 'single'}
+                   onchange={() => (storageMode = 'single')} />
+            <span>One CSV on the controller</span>
+            <span class="muted small">— needs no browser; you download it later</span>
+          </label>
+          <label class="radio">
+            <input type="radio" name="storage" value="continuous_offload"
+                   checked={storageMode === 'continuous_offload'}
+                   disabled={!offload.available || !continuousFits}
+                   onchange={() => (storageMode = 'continuous_offload')} />
+            <span>Continuous, handed to this device</span>
+            <span class="muted small">
+              — {size(segmentBytes)} parts, verified and then erased from the
+              controller
+            </span>
+          </label>
+          {#if !continuousFits}
+            <p class="small muted">
+              There is too little room on the controller for even the smallest
+              parts ({size(MIN_SEGMENT_BYTES)} each, two at a time). Delete a
+              dataset first.
+            </p>
+          {/if}
+          {#if storageMode === 'continuous_offload'}
+            <p class="small warn">
+              This tab must stay open. The controller keeps recording if it
+              closes, but only while its queue has room — and nothing already
+              queued is ever deleted to make more.
+            </p>
+          {:else if !offload.available}
+            <p class="small muted">{offload.unavailableReason}</p>
+          {/if}
+          {#if roomWarning}<p class="small warn">{roomWarning}</p>{/if}
+        </fieldset>
         <button type="button" class="primary"
                 disabled={busy || selected.length === 0 || controller.runningExperiment}
                 onclick={start}>Record</button>
@@ -188,6 +374,64 @@
       {/if}
     {/if}
   </section>
+
+  {#if offload.sessions.length > 0}
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Collected on this device</h2>
+        <span class="muted small">
+          Parts the controller handed over and then erased. This browser is the
+          only place they exist — export anything worth keeping.
+        </span>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>Session</th><th>Started</th><th class="right">Parts</th>
+            <th class="right">Size</th><th class="right">Rows</th>
+            <th>State</th><th></th>
+          </tr>
+        </thead>
+        <tbody>
+          {#each offload.sessions as session (session.key)}
+            <tr>
+              <td>
+                <strong>{session.name}</strong>
+                <div class="muted numeric small">{session.sessionId}</div>
+              </td>
+              <td class="numeric small">{when(session.startedEpochMs)}</td>
+              <td class="right numeric">
+                {session.segmentsCollected}
+                {#if session.contiguousThrough < session.segmentsCollected}
+                  <span class="warn small" title="a part is missing in the middle">
+                    gap
+                  </span>
+                {/if}
+              </td>
+              <td class="right numeric">{size(session.bytesCollected)}</td>
+              <td class="right numeric">{session.rows}</td>
+              <td class="small">{session.state}</td>
+              <td class="row-actions">
+                <button type="button" disabled={busy}
+                        onclick={() => void exportMerged(session)}>CSV</button>
+                <button type="button" disabled={busy}
+                        onclick={() => void exportZip(session)}>ZIP</button>
+                <button type="button" class="danger" disabled={busy}
+                        onclick={() => act(() => offload.deleteSession(session.sessionId))}>
+                  Delete local
+                </button>
+              </td>
+            </tr>
+          {/each}
+        </tbody>
+      </table>
+      <p class="small muted">
+        The ZIP keeps every part exactly as the controller wrote it, checksums
+        and all; the merged CSV is a convenience rebuilt from them, and says so
+        in its footer when a part is missing.
+      </p>
+    </section>
+  {/if}
 
   <section class="panel">
     <div class="panel-head">
@@ -267,6 +511,19 @@
 </div>
 
 <style>
+  .mode { border: 1px solid var(--line); border-radius: 6px; padding: 0.4rem 0.6rem;
+          margin: 0; display: grid; gap: 0.2rem; grid-column: 1 / -1; }
+  .mode legend { padding: 0 0.3rem; }
+  .radio { display: flex; align-items: baseline; gap: 0.4rem; cursor: pointer;
+           font-size: 0.82rem; }
+  /* The page styles `input` as a full-width field; a radio is not one. */
+  .mode input[type=radio] { width: auto; flex: none; margin: 0; }
+  .offload { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+             gap: 0.5rem; align-items: baseline; border-top: 1px solid var(--line);
+             margin-top: 0.5rem; padding-top: 0.5rem; }
+  .offload p { grid-column: 1 / -1; margin: 0; }
+  .row-actions { display: flex; gap: 0.25rem; justify-content: flex-end; }
+
   .page { display: grid; gap: 1rem; }
   .panel { background: var(--surface); border: 1px solid var(--line);
            border-radius: 8px; padding: 0.8rem 0.9rem; display: grid; gap: 0.6rem; }

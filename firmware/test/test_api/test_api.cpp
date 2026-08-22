@@ -409,6 +409,7 @@ static void test_system_names_the_controller_independently_of_its_address() {
   TEST_ASSERT_TRUE(std::strcmp(id, "192.168.4.1") != 0);
 }
 
+
 static void test_reboot_requires_post_and_calls_the_hook() {
   ApiRig rig;
   g_rebootCalls = 0;
@@ -2331,6 +2332,72 @@ const char* kLoggedScenario = R"({
 
 }  // namespace
 
+// ===========================================================================
+//  Milestone 15 — the offload protocol over REST.
+//
+//  The route that matters is the ACK: it is the only thing in the system that
+//  deletes measurements, and it does so on the say-so of a browser.  These
+//  tests are about what the firmware demands before it believes that.
+// ===========================================================================
+static void test_a_continuous_log_needs_a_collector_to_start() {
+  ApiRig rig;
+  prepareRig(rig);
+  // Refused before a single row exists: without an owner nothing could ever
+  // acknowledge, so the queue would fill the filesystem and stop the log.
+  const ApiResponse refused = rig.post(
+      "/api/v1/logs/start",
+      R"({"name":"x","rate_hz":1,"channels":["ref_signal"],
+          "storage_mode":"continuous_offload"})");
+  TEST_ASSERT_EQUAL_INT(400, refused.status);
+
+  const ApiResponse bogus = rig.post(
+      "/api/v1/logs/start",
+      R"({"name":"x","rate_hz":1,"channels":["ref_signal"],
+          "storage_mode":"sideways","collector_id":"browser-01"})");
+  TEST_ASSERT_EQUAL_INT(400, bogus.status);
+}
+
+static void test_the_segment_routes_refuse_what_they_cannot_prove() {
+  ApiRig rig;
+  rig.signIn();
+
+  // An unknown session is a 404 on every route, not an empty success.
+  TEST_ASSERT_EQUAL_INT(404, rig.get("/api/v1/logs/log_9999/segments").status);
+  TEST_ASSERT_EQUAL_INT(
+      404, rig.get("/api/v1/logs/log_9999/segments/1/export.csv").status);
+  const ApiResponse ack = rig.post(
+      "/api/v1/logs/log_9999/segments/1/ack",
+      R"({"collector_id":"browser-01","bytes":10,"payload_crc32":"00000000"})");
+  TEST_ASSERT_EQUAL_INT(404, ack.status);
+}
+
+static void test_a_single_mode_log_reports_no_offload_queue() {
+  ApiRig rig;
+  prepareRig(rig);
+  const ApiResponse started = rig.post(
+      "/api/v1/logs/start",
+      R"({"name":"ordinary","rate_hz":1,"channels":["ref_signal"]})");
+  TEST_ASSERT_EQUAL_INT(200, started.status);
+  rig.post("/api/v1/logs/stop", "{}");
+
+  // The old client asked for nothing new and got the old behaviour.
+  const ApiResponse listed = rig.get("/api/v1/logs");
+  TEST_ASSERT_EQUAL_INT(200, listed.status);
+  JsonArrayConst logs = listed.body["logs"].as<JsonArrayConst>();
+  TEST_ASSERT_TRUE(logs.size() >= 1);
+  TEST_ASSERT_EQUAL_STRING("single", logs[0]["mode"] | "single");
+
+  // By the id it actually got: hard-coding log_0001 tests the numbering of the
+  // suite, not the route.
+  char route[64];
+  std::snprintf(route, sizeof(route), "/api/v1/logs/%s/segments",
+                logs[0]["id"] | "");
+  const ApiResponse segments = rig.get(route);
+  TEST_ASSERT_EQUAL_INT(200, segments.status);
+  TEST_ASSERT_EQUAL_UINT(0, segments.body["pending"].as<JsonArrayConst>().size());
+  TEST_ASSERT_EQUAL_STRING("single", segments.body["mode"] | "");
+}
+
 static void test_a_dataset_says_what_it_was_measured_with() {
   ApiRig rig;
   prepareRig(rig);
@@ -2812,6 +2879,9 @@ int main(int, char**) {
   RUN_TEST(test_unknown_routes_and_methods_are_refused_cleanly);
   RUN_TEST(test_system_and_diagnostics_report_real_numbers);
   RUN_TEST(test_system_names_the_controller_independently_of_its_address);
+  RUN_TEST(test_a_continuous_log_needs_a_collector_to_start);
+  RUN_TEST(test_the_segment_routes_refuse_what_they_cannot_prove);
+  RUN_TEST(test_a_single_mode_log_reports_no_offload_queue);
   RUN_TEST(test_reboot_requires_post_and_calls_the_hook);
   RUN_TEST(test_dry_run_validates_without_creating_anything);
   RUN_TEST(test_dry_run_and_create_agree_about_a_taken_key);

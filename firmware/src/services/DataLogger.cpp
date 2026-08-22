@@ -24,8 +24,35 @@ const char* toString(LogStopReason reason) {
     case LogStopReason::kFull:        return "medium_full";
     case LogStopReason::kWriteFailed: return "write_failed";
     case LogStopReason::kShutdown:    return "shutdown";
+    case LogStopReason::kOffloadBacklogFull: return "offload_backlog_full";
   }
   return "none";
+}
+
+const char* toString(LogStorageMode mode) {
+  switch (mode) {
+    case LogStorageMode::kSingle:            return "single";
+    case LogStorageMode::kContinuousOffload: return "continuous_offload";
+  }
+  return "single";
+}
+
+bool parseStorageMode(const char* text, LogStorageMode& out) {
+  if (text == nullptr || text[0] == '\0') {
+    // An old client that never heard of modes gets the old behaviour.  That is
+    // the whole compatibility story, and it belongs in one place.
+    out = LogStorageMode::kSingle;
+    return true;
+  }
+  if (std::strcmp(text, "single") == 0) {
+    out = LogStorageMode::kSingle;
+    return true;
+  }
+  if (std::strcmp(text, "continuous_offload") == 0) {
+    out = LogStorageMode::kContinuousOffload;
+    return true;
+  }
+  return false;
 }
 
 Status DataLogger::begin() {
@@ -133,6 +160,8 @@ Status DataLogger::start(const LogSpec& spec, double expectedSeconds) {
   status_.name = spec.name;
   status_.channelCount = spec.channelCount;
   status_.rateHz = spec.rateHz;
+  status_.storageMode = spec.storageMode;
+  status_.nextGlobalRow = 1;
 
   const Status opened = sink_->openSession(spec_, columns, columnCount, status_.id);
   if (!opened.ok()) return opened;
@@ -140,6 +169,9 @@ Status DataLogger::start(const LogSpec& spec, double expectedSeconds) {
   periodUs_ = static_cast<Micros>(1e6 / spec.rateHz);
   lastRowUs_ = 0;
   buffered_ = 0;
+  nextGlobalRow_ = 1;
+  bufferedRows_ = 0;
+  firstBufferedGlobalRow_ = 0;
   status_.recording = true;
   status_.startedUs = clock_.nowMicros();
   status_.startedEpochMs = clock_.epochMillis();
@@ -156,7 +188,7 @@ void DataLogger::endSession(LogStopReason reason, const Error& detail) {
   // configurable: the dataset says it lost them, which is the whole point.
   if (buffered_ > 0 && sink_ != nullptr) {
     if (sink_->writableBytes() >= buffered_) {
-      const Status written = sink_->appendRows(buffer_, buffered_);
+      const Status written = sink_->appendRows(pendingBatch());
       if (written.ok()) {
         status_.bytesWritten += buffered_;
       } else {
@@ -168,6 +200,7 @@ void DataLogger::endSession(LogStopReason reason, const Error& detail) {
       status_.droppedRows += 1;
     }
     buffered_ = 0;
+    bufferedRows_ = 0;
   }
 
   status_.recording = false;
@@ -204,12 +237,20 @@ void DataLogger::appendRow(Micros now) {
   char row[512];
   std::size_t used = 0;
 
+  // t_ms is measured from the start of the LOGICAL session and is not reset by
+  // rotation: a segment boundary is a fact about files, not about the
+  // experiment (M15 §3.1).
   const Micros elapsedMs = (now - status_.startedUs) / 1000ULL;
   const EpochMs epoch = clock_.epochMillis();
+  const std::uint32_t globalRow = nextGlobalRow_;
   used += static_cast<std::size_t>(std::snprintf(
       row + used, sizeof(row) - used, "%llu,%llu",
       static_cast<unsigned long long>(elapsedMs),
       static_cast<unsigned long long>(epoch)));
+  if (spec_.storageMode == LogStorageMode::kContinuousOffload) {
+    used += static_cast<std::size_t>(std::snprintf(
+        row + used, sizeof(row) - used, ",%u", static_cast<unsigned>(globalRow)));
+  }
 
   // One bit per channel: set when that channel's value was anything other than
   // GOOD at this instant.  Cheaper than a quality column per channel and, more
@@ -244,15 +285,37 @@ void DataLogger::appendRow(Micros now) {
   used += static_cast<std::size_t>(std::snprintf(
       row + used, sizeof(row) - used, ",%u\n", qualityMask));
 
+  // The number is consumed whether or not the row survives.  A dropped row that
+  // renumbered the ones after it would close the gap in the CSV and make a loss
+  // undetectable by reading the file — which is the only way most people will
+  // ever read it.
+  ++nextGlobalRow_;
+  status_.nextGlobalRow = nextGlobalRow_;
+
   if (buffered_ + used > kBufferBytes) {
     // The medium is not keeping up.  Counted, reported in the footer and in the
     // index, and never quietly skipped.
     ++status_.droppedRows;
     return;
   }
+  if (bufferedRows_ == 0) firstBufferedGlobalRow_ = globalRow;
   std::memcpy(buffer_ + buffered_, row, used);
   buffered_ += used;
+  ++bufferedRows_;
+  lastBufferedGlobalRow_ = globalRow;
   ++status_.rows;
+}
+
+/** The pending buffer, described for the store.  Empty when nothing is held. */
+LogBatch DataLogger::pendingBatch() const {
+  LogBatch batch;
+  batch.text = buffer_;
+  batch.bytes = buffered_;
+  batch.rows = bufferedRows_;
+  batch.firstGlobalRow = firstBufferedGlobalRow_;
+  batch.lastGlobalRow = lastBufferedGlobalRow_;
+  batch.droppedRowsTotal = status_.droppedRows;
+  return batch;
 }
 
 void DataLogger::sampleTick(Micros now) {
@@ -276,13 +339,34 @@ void DataLogger::flushTick() {
     return;
   }
 
-  const Status written = sink_->appendRows(buffer_, buffered_);
+  const Status written = sink_->appendRows(pendingBatch());
   if (!written.ok()) {
-    endSession(LogStopReason::kWriteFailed, written);
+    // A store that has run out of room for the OFFLOAD QUEUE says so
+    // specifically, so the operator is told to reconnect the collector rather
+    // than to go and delete datasets.
+    endSession(written.code == ErrorCode::kOutOfCapacity
+                   ? LogStopReason::kOffloadBacklogFull
+                   : LogStopReason::kWriteFailed,
+               written);
     return;
   }
   status_.bytesWritten += buffered_;
   buffered_ = 0;
+  bufferedRows_ = 0;
+
+  // A part closed during that write.  Told to whoever is listening so the
+  // collector starts at once instead of at its next poll.
+  const std::uint32_t ready = sink_->takeSegmentReadyNotice();
+  if (ready != 0) {
+    Event event;
+    event.type = EventType::kLogSegmentReady;
+    event.severity = 1;
+    event.code = ErrorCode::kOk;
+    event.source = ready;
+    event.detail = "a log segment is ready to collect";
+    event.timestamp = clock_.nowMicros();
+    events_.publish(event);
+  }
 }
 
 }  // namespace lc

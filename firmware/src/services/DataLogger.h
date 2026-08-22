@@ -66,9 +66,35 @@ enum class LogStopReason : std::uint8_t {
   kFull,         // the medium reached its reserve — the dataset is TRUNCATED
   kWriteFailed,  // the medium answered with an error — also TRUNCATED
   kShutdown,     // the rig was reconfigured or the controller is going down
+  // M15: the offload queue filled the filesystem because nobody was collecting.
+  // Distinct from kFull on purpose — "the disk is full" and "the tablet that
+  // was supposed to be emptying it went away" call for different fixes.
+  kOffloadBacklogFull,
 };
 
 const char* toString(LogStopReason reason);
+
+/**
+ * Where a dataset lives while it is being written (M15).
+ *
+ *  kSingle             One CSV that stays on the controller until somebody
+ *                      downloads it.  Needs no client, and is what every
+ *                      existing session and every old API caller gets.
+ *  kContinuousOffload  One LOGICAL session split into ~100 KiB CSV segments.
+ *                      A closed segment is handed to the browser, verified,
+ *                      acknowledged, and only then deleted from flash.
+ *
+ * The second mode turns 640 KiB of LittleFS into a transfer buffer rather than
+ * an archive.  It is strictly more capable and strictly more fragile: it needs
+ * a tab open at the other end, and the interface says so.
+ */
+enum class LogStorageMode : std::uint8_t {
+  kSingle = 0,
+  kContinuousOffload,
+};
+
+const char* toString(LogStorageMode mode);
+bool parseStorageMode(const char* text, LogStorageMode& out);
 
 struct LogSpec {
   LabelString name;
@@ -84,6 +110,19 @@ struct LogSpec {
   LabelString experiment;
   LabelString operatorName;
   LabelString sample;
+
+  // --- M15 -----------------------------------------------------------------
+  LogStorageMode storageMode = LogStorageMode::kSingle;
+  // Ceiling for ONE segment file, header and footer included.  0 means "use the
+  // default"; the store clamps it to its own bounds.
+  std::size_t segmentBytes = 0;
+  /**
+   * Which browser tab is collecting.  Not a credential — the REST routes carry
+   * the ordinary authorisation — but the thing that stops a second tab, opened
+   * by the same operator on the same rig, from acknowledging and thereby
+   * deleting segments the first tab never received.
+   */
+  KeyString collectorId;
 };
 
 struct LogStatus {
@@ -100,6 +139,35 @@ struct LogStatus {
   bool truncated = false;
   LogStopReason stopReason = LogStopReason::kNone;
   Error lastError;
+  // --- M15 -----------------------------------------------------------------
+  LogStorageMode storageMode = LogStorageMode::kSingle;
+  // The row number the NEXT sample will carry.  One past the last written.
+  std::uint32_t nextGlobalRow = 1;
+};
+
+/**
+ * One handover of formatted rows from the logger to the store (M15).
+ *
+ * The old interface passed text and a byte count, which was enough to write a
+ * file and not enough to describe a segment: a footer has to state how many
+ * rows a part holds and which global row numbers it spans, and the store has no
+ * way to work that out by looking at the characters.
+ *
+ * A batch is never split across two files.  It is at most kBufferBytes (4 KiB)
+ * and the smallest permitted segment is 32 KiB, so a batch that does not fit in
+ * the current segment always fits at the start of the next one.
+ */
+struct LogBatch {
+  const char* text = nullptr;
+  std::size_t bytes = 0;
+  std::uint32_t rows = 0;
+  std::uint32_t firstGlobalRow = 0;
+  std::uint32_t lastGlobalRow = 0;
+  // Rows lost to a slow medium since the session started.  Carried here, beyond
+  // what the M15 sketch asked for, so that EVERY segment footer states it: a
+  // part that travels to a tablet and is read there a week later has to be able
+  // to say on its own that rows were missing.
+  std::uint32_t droppedRowsTotal = 0;
 };
 
 // Implemented by storage/LogStore: the logger formats and counts, the store
@@ -110,12 +178,15 @@ class ILogSink {
   // Opens a dataset and writes its header.  `id` is filled in by the sink.
   virtual Status openSession(const LogSpec& spec, const char* const* columns,
                              std::size_t columnCount, KeyString& id) = 0;
-  virtual Status appendRows(const char* text, std::size_t bytes) = 0;
+  virtual Status appendRows(const LogBatch& batch) = 0;
   // Closes the dataset: footer, totals, and the index entry.  Called for every
   // ending, including the ones nobody wanted.
   virtual void closeSession(const LogStatus& status) = 0;
   // Bytes that may still be written before the reserve is reached.
   virtual std::size_t writableBytes() const = 0;
+  /** M15: the sequence number of a segment that has just been closed, or 0.
+   *  Defaulted, because a store that never rotates has nothing to announce. */
+  virtual std::uint32_t takeSegmentReadyNotice() { return 0; }
 };
 
 class DataLogger {
@@ -156,6 +227,7 @@ class DataLogger {
   static void sampleTrampoline(void* context);
   static void flushTrampoline(void* context);
   void appendRow(Micros now);
+  LogBatch pendingBatch() const;
   void endSession(LogStopReason reason, const Error& detail);
   void publish(std::uint8_t severity, const char* detail, ErrorCode code);
 
@@ -173,6 +245,15 @@ class DataLogger {
   char buffer_[kBufferBytes];
   std::size_t buffered_ = 0;
   bool truncationNotice_ = false;
+
+  // --- M15: continuity across segment boundaries ---------------------------
+  // The global row number is the thing that survives rotation.  If a row is
+  // dropped because flash fell behind, the number is still consumed — so the
+  // gap is VISIBLE in the CSV as a jump, rather than hidden by renumbering.
+  std::uint32_t nextGlobalRow_ = 1;
+  std::uint32_t bufferedRows_ = 0;
+  std::uint32_t firstBufferedGlobalRow_ = 0;
+  std::uint32_t lastBufferedGlobalRow_ = 0;
 
   TaskId sampleTask_ = kInvalidTask;
   TaskId flushTask_ = kInvalidTask;
