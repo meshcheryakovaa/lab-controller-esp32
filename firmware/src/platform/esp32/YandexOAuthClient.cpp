@@ -148,8 +148,11 @@ CloudResult YandexOAuthClient::postForm(const char* url, const char* body,
     http.addHeader("Authorization", header);
   }
 
-  const int status = http.POST(reinterpret_cast<const std::uint8_t*>(body),
-                               std::strlen(body));
+  const int status = http.POST(
+    const_cast<std::uint8_t*>(
+        reinterpret_cast<const std::uint8_t*>(body)),
+    std::strlen(body));
+
   httpStatus = status;
   if (status <= 0) {
     http.end();

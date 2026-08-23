@@ -86,8 +86,8 @@ class CloudUploadQueue {
   static constexpr const char* kPath = "/data/cloud-queue.json";
   /** More than a day of segments at a realistic rate, and small enough that the
    *  document stays well inside kMaxBytes. */
-  static constexpr std::size_t kMaxJobs = 48;
-  static constexpr std::size_t kMaxBytes = 16 * 1024;
+  static constexpr std::size_t kMaxJobs = 8;
+  static constexpr std::size_t kMaxBytes = 2 * 1024;
   static constexpr int kSchemaVersion = 1;
 
   explicit CloudUploadQueue(IStorageBackend& backend) : backend_(backend) {}
