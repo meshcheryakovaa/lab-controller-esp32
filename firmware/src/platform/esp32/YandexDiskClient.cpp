@@ -320,7 +320,7 @@ CloudResult YandexDiskClient::upload(const char* remotePath,
   // attaching the OAuth token here would hand it to whatever host answered.
   http.addHeader("Content-Type", "text/csv");
 
-  // A stream that pulls from the filesystem 4 KiB at a time.  HTTPClient wants
+  // A stream that pulls from the filesystem 2 KiB at a time.  HTTPClient wants
   // a Stream, and this is the adapter that gives it one without the file ever
   // being in RAM whole.
   class SegmentStream final : public Stream {

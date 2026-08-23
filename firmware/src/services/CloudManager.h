@@ -121,7 +121,7 @@ class CloudManager final : public ICloudUploadObserver {
   void failJob(CloudJob& job, const CloudResult& result);
   void publish(EventType type, std::uint8_t severity, const char* detail,
                ErrorCode code, std::uint32_t source);
-  /** Computes the MD5 of a local file 4 KiB at a time.  Never holds it whole. */
+  /** Computes the MD5 of a local file 1 KiB at a time.  Never holds it whole. */
   bool computeMd5(const char* path, FixedString<Md5::kTextBytes>& out,
                   std::uint64_t& bytes);
   bool networkReady() const;

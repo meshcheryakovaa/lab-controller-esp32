@@ -16,7 +16,7 @@
 //     destination in this feature chosen by a remote answer rather than by us
 //     (isTrustedUploadUrl, tested in test_cloud).
 //
-//  3. The file is streamed.  4 KiB at a time, from a buffer owned by this
+//  3. The file is streamed.  2 KiB at a time, from a buffer owned by this
 //     object rather than the stack, because the whole feature exists to move
 //     100 KiB files on a device with about that much usable heap.
 // =============================================================================
@@ -34,7 +34,7 @@ namespace platform {
 class YandexDiskClient final : public ICloudProvider {
  public:
   static constexpr const char* kApiBase = "https://cloud-api.yandex.net/v1/disk";
-  static constexpr std::size_t kUploadBufferBytes = 4096;
+  static constexpr std::size_t kUploadBufferBytes = 2048;
   static constexpr std::uint32_t kRequestTimeoutMs = 15000;
   static constexpr std::size_t kMaxResponseBytes = 4096;
 

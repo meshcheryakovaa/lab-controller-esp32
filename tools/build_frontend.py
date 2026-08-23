@@ -29,6 +29,9 @@ apart.  So now:
     that teaches you to distrust the tool.
   * data/www is replaced only after a build succeeds.  A failed build leaves the
     previous, working assets in place rather than an empty directory.
+  * Compressible assets are stored ONLY as .gz.  PsychicHttp transparently
+    serves the compressed twin for the original URL, so keeping both copies
+    wastes more than 300 KiB of the LittleFS partition.
   * Skipping is FATAL for filesystem targets (uploadfs / buildfs).  Uploading an
     empty image is not a lesser version of uploading the UI; it is the thing
     that wasted the evening.
@@ -183,8 +186,13 @@ def stage_into_littlefs():
                 total_stored += raw_size
                 continue
             target = os.path.join(target_root, name + ".gz")
-            with open(source, "rb") as src, gzip.open(target, "wb", compresslevel=9) as dst:
-                shutil.copyfileobj(src, dst)
+            # mtime=0 makes identical frontend sources produce identical
+            # filesystem images.  filename="" avoids storing the source name
+            # inside the gzip header.
+            with open(source, "rb") as src, open(target, "wb") as raw_dst:
+                with gzip.GzipFile(filename="", mode="wb", compresslevel=9,
+                                   fileobj=raw_dst, mtime=0) as dst:
+                    shutil.copyfileobj(src, dst)
             total_stored += os.path.getsize(target)
 
     if files_staged == 0:
