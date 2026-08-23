@@ -84,7 +84,13 @@ void PsychicHttpAdapter::configureAndRegisterOnce() {
   // Serving a file walks LittleFS -> VFS -> esp_littlefs, which is a deep call
   // chain; the default 4 KB HTTP task stack overflows partway through a large
   // asset and takes the board with it.
-  server_.config.stack_size = 8192;
+  //
+  // RAISED TO 16 KB IN M16, AND IT MUST NOT GO BACK.  8 KB was enough until the
+  // network routes arrived: those handlers sit on top of the Wi-Fi driver and
+  // NVS as well as the JSON document, and the board answered with
+  // "Stack canary watchpoint triggered (httpd)" — a crash inside the HTTP task
+  // rather than an error, because a blown stack has nothing left to report with.
+  server_.config.stack_size = 16 * 1024;
   // A configuration import is the biggest body this API accepts.
   server_.maxRequestBodySize = 16 * 1024;
 

@@ -223,6 +223,16 @@ void TelemetryBatcher::sendEvent(const Event& event) {
       message["sequence"] = event.source;
       break;
 
+    case EventType::kNetworkStateChanged:
+      // Deliberately carries no address and no SSID: this frame exists to say
+      // "ask again", and a frame that carried state would be a second source of
+      // truth to keep in step with GET /network.  It also travels over the very
+      // connection the network change may be about to break, so it is the last
+      // thing that should be believed on its own.
+      message["type"] = "network";
+      message["message"] = (event.detail != nullptr) ? event.detail : "";
+      break;
+
     default:
       message["type"] = "system";
       message["severity"] = event.severity;

@@ -132,6 +132,7 @@ RestApi::Services makeApiServices() {
   services.system = &g_system;
   services.buses = &g_buses;
   services.metrics = &g_metrics;
+  services.network = &g_wifi;
   services.reboot = requestReboot;
   return services;
 }

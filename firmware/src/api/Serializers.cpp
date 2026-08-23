@@ -244,4 +244,51 @@ void serializeSchedulerStats(const Scheduler& scheduler, JsonArray out) {
   }
 }
 
+
+void serializeNetwork(const INetworkManager& network, JsonObject out) {
+  const NetworkStatus status = network.status();
+
+  out["state"] = toString(status.state);
+  out["configured"] = status.configured;
+  out["ssid"] = jsonCopy(status.ssid.c_str());
+  // What the operator needs to know is whether a password is REMEMBERED, which
+  // this answers without the password existing anywhere in the response.
+  out["password_set"] = status.configured;
+  out["hostname"] = jsonCopy(status.hostname.c_str());
+  // The address that actually works today.  ".local" is offered as well as the
+  // IP, never instead of it: plenty of machines cannot resolve mDNS, and an
+  // instrument that only tells you a name you cannot reach is unreachable.
+  if (!status.hostname.empty()) {
+    char local[kHostnameLength + 8];
+    std::snprintf(local, sizeof(local), "%s.local", status.hostname.c_str());
+    out["mdns"] = jsonCopy(local);
+  }
+  // True while credentials are being proved, so the page knows to keep polling
+  // rather than concluding the attempt failed.
+  out["pending"] = status.testing;
+
+  JsonObject station = out["station"].to<JsonObject>();
+  station["connected"] = status.stationConnected;
+  station["ip"] = jsonCopy(status.stationIp.c_str());
+  station["rssi"] = status.rssi;
+
+  JsonObject ap = out["access_point"].to<JsonObject>();
+  ap["active"] = status.accessPointActive;
+  ap["ssid"] = jsonCopy(status.accessPointSsid.c_str());
+  ap["ip"] = jsonCopy(status.accessPointIp.c_str());
+
+  out["reconnects"] = status.reconnects;
+  out["disconnects"] = status.disconnects;
+  out["last_disconnect_reason"] =
+      jsonCopy(status.lastDisconnectReason.c_str());
+
+  if (status.lastError.ok()) {
+    out["last_error"] = nullptr;
+  } else {
+    JsonObject error = out["last_error"].to<JsonObject>();
+    error["code"] = status.lastError.symbol();
+    error["detail"] = jsonCopy(status.lastError.detail.c_str());
+  }
+}
+
 }  // namespace lc

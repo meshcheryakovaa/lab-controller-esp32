@@ -16,6 +16,7 @@ import type {
   Channel, ControlDocument, ControlLoop, Device, Experiment, ExperimentSummary,
   LogEntry, LoggingStatus, LoopMode, ModuleManifest, OutputState, RunRecord,
   RunStatus, SafetyLimit,
+  NetworkStatus, NetworkScan, NetworkState, ScanState,
 } from './types';
 import type { Dashboard, DashboardSummary } from './widgets';
 
@@ -371,4 +372,25 @@ export const api = {
               devices_failed: number; backup_saved?: boolean }>(
       'POST', '/config/import',
       password ? { ...document, password } : document),
+
+  // --- M16: the house network ---------------------------------------------
+  network: () => request<NetworkStatus>('GET', '/network'),
+
+  startNetworkScan: () => request<{ state: ScanState }>('POST', '/network/scan', {}),
+  networkScan: () => request<NetworkScan>('GET', '/network/scan'),
+
+  /** Asks the controller to PROVE these credentials.  Answers 202 as soon as
+   *  the attempt is accepted — the caller polls network() for the outcome.
+   *  Anything else would mean holding a request open for the fifteen seconds a
+   *  join can take, on the same server the poll has to reach. */
+  connectNetwork: (ssid: string, password: string) =>
+    request<{ accepted: boolean; state: NetworkState }>(
+      'POST', '/network/connect', { ssid, password }),
+
+  forgetNetwork: () =>
+    request<{ cleared: boolean; state: NetworkState; ip: string; ssid: string }>(
+      'DELETE', '/network/config'),
+
+  setHostname: (hostname: string) =>
+    request<{ hostname: string }>('PUT', '/network/hostname', { hostname }),
 };

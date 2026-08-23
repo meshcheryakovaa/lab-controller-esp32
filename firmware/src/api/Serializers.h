@@ -14,6 +14,7 @@
 #include "core/ResourceManager.h"
 #include "core/Scheduler.h"
 #include "services/ChannelManager.h"
+#include "services/INetworkManager.h"
 
 namespace lc {
 
@@ -42,5 +43,15 @@ void serializeGeometry(const Geometry& geometry, JsonObject out);
 // Per-task scheduler statistics — the fastest way to find what is stalling the
 // control loop.
 void serializeSchedulerStats(const Scheduler& scheduler, JsonArray out);
+
+/**
+ * The network, as the interface and the diagnostics page both see it (M16).
+ *
+ * One function, two callers, and that is on purpose: /network and
+ * /diagnostics have to agree, and the surest way to keep a Wi-Fi password out
+ * of BOTH is for neither to assemble its own object.  There is nothing to
+ * redact here — NetworkStatus has no password field.
+ */
+void serializeNetwork(const INetworkManager& network, JsonObject out);
 
 }  // namespace lc

@@ -49,7 +49,8 @@ void RestApi::handle(const ApiRequest& request, ApiResponse& response) {
     for (const char* name :
          {"system", "diagnostics", "modules", "gpio", "buses", "devices",
           "channels", "processing", "calibrations", "outputs", "control",
-          "experiments", "logs", "auth", "firmware", "dashboards", "config"}) {
+          "experiments", "logs", "network", "auth", "firmware", "dashboards",
+          "config"}) {
       resources.add(name);
     }
     return;
@@ -96,6 +97,8 @@ void RestApi::handle(const ApiRequest& request, ApiResponse& response) {
     handleExperiments(request, path, response);
   } else if (std::strcmp(group, "logs") == 0) {
     handleLogs(request, path, response);
+  } else if (std::strcmp(group, "network") == 0) {
+    handleNetwork(request, path, response);
   } else if (std::strcmp(group, "auth") == 0) {
     handleAuth(request, path, response);
   } else if (std::strcmp(group, "firmware") == 0) {
@@ -363,6 +366,17 @@ void RestApi::handleDiagnostics(ApiResponse& response) {
     network["mode"] = s_.metrics->networkMode();
     network["ip"] = jsonCopy(s_.metrics->ipAddress());
     network["rssi"] = s_.metrics->wifiRssi();
+  }
+
+  // M16.  Written through the same serialiser the /network route uses, so the
+  // two pages cannot disagree and neither can grow a password field.  It is
+  // merged into whatever the metrics block already wrote rather than replacing
+  // it: "mode" and "ip" have been in diagnostics since M11 and something may be
+  // reading them.
+  if (s_.network != nullptr) {
+    JsonObject network = out["network"].as<JsonObject>();
+    if (network.isNull()) network = out["network"].to<JsonObject>();
+    serializeNetwork(*s_.network, network);
   }
 
   JsonObject loop = out["loop"].to<JsonObject>();
@@ -2912,6 +2926,181 @@ void RestApi::handleConfig(const ApiRequest& request, const PathSegments& path,
   }
 
   response.setError(404, fail(ErrorCode::kNotFound, "config endpoint"));
+}
+
+
+// ===========================================================================
+//  Milestone 16 — the house network.
+//
+//  ONE RULE GOVERNS EVERY ROUTE HERE (ADR-0022): changing the network settings
+//  must never make the instrument unreachable.  That shows up as three
+//  concrete behaviours, and they are the ones worth reading the code for:
+//
+//    * The password is never in a response.  Not masked, not truncated — the
+//      NetworkStatus structure has no field to put it in, so no serialiser can
+//      leak what it cannot see.
+//    * /connect answers 202 and returns immediately.  It never waits for the
+//      join.  A handler that blocked for fifteen seconds would stall the very
+//      poll the page uses to watch the result, on the same HTTP task.
+//    * Nothing here is destructive on failure.  New credentials are proved
+//      before they replace working ones, and the fallback access point stays up
+//      throughout.
+// ===========================================================================
+void RestApi::handleNetwork(const ApiRequest& request, const PathSegments& path,
+                            ApiResponse& response) {
+  if (s_.network == nullptr) {
+    response.setError(501, fail(ErrorCode::kNotSupported,
+                                "this build has no network manager"));
+    return;
+  }
+
+  // --- POST /network/scan, GET /network/scan --------------------------------
+  if (path.count() >= 4 && path.is(3, "scan")) {
+    if (request.method == HttpMethod::kPost) {
+      if (!requireWriteAccess(request, response)) return;
+      const Status started = s_.network->beginScan();
+      if (!started.ok()) {
+        response.setError(started);
+        return;
+      }
+      JsonObject out = response.body.to<JsonObject>();
+      out["state"] = toString(s_.network->scanState());
+      return;
+    }
+    if (request.method != HttpMethod::kGet) {
+      response.setError(405, fail(ErrorCode::kNotSupported, "use GET or POST"));
+      return;
+    }
+    JsonObject out = response.body.to<JsonObject>();
+    out["state"] = toString(s_.network->scanState());
+    NetworkCandidate found[kMaxScanResults];
+    const std::size_t count = s_.network->scanResults(found, kMaxScanResults);
+    JsonArray networks = out["networks"].to<JsonArray>();
+    for (std::size_t i = 0; i < count; ++i) {
+      JsonObject entry = networks.add<JsonObject>();
+      entry["ssid"] = jsonCopy(found[i].ssid.c_str());
+      entry["rssi"] = found[i].rssi;
+      entry["channel"] = found[i].channel;
+      entry["secured"] = found[i].secured;
+    }
+    return;
+  }
+
+  // --- POST /network/connect ------------------------------------------------
+  if (path.count() >= 4 && path.is(3, "connect")) {
+    if (request.method != HttpMethod::kPost) {
+      response.setError(405, fail(ErrorCode::kNotSupported, "use POST"));
+      return;
+    }
+    if (!requireWriteAccess(request, response)) return;
+    JsonDocument body;
+    if (!parseBody(request, body, response)) return;
+
+    const char* ssid = body["ssid"] | "";
+    if (ssid[0] == '\0') {
+      response.setError(fail(ErrorCode::kInvalidArgument, "ssid is required"));
+      response.body["error"]["field"] = "ssid";
+      return;
+    }
+    if (std::strlen(ssid) >= kSsidLength) {
+      response.setError(413, fail(ErrorCode::kPayloadTooLarge,
+                                  "an SSID is at most 32 bytes"));
+      return;
+    }
+    const char* password = body["password"] | "";
+    // WPA2 will not accept a shorter key, so refusing here turns a fifteen
+    // second timeout and a puzzled operator into an immediate, specific answer.
+    // An open network legitimately has none, which is why empty is allowed.
+    if (password[0] != '\0' && std::strlen(password) < 8) {
+      response.setError(fail(ErrorCode::kInvalidArgument,
+                             "a WPA password is at least 8 characters"));
+      response.body["error"]["field"] = "password";
+      return;
+    }
+
+    const Status accepted = s_.network->testCredentials(ssid, password);
+    if (!accepted.ok()) {
+      // kResourceBusy becomes 409: a second attempt while one is in flight is
+      // a conflict, not a malformed request, and the page shows it as "already
+      // connecting" rather than as an error in what was typed.
+      if (accepted.code == ErrorCode::kResourceBusy) {
+        response.setError(409, accepted);
+      } else {
+        response.setError(accepted);
+      }
+      return;
+    }
+    // 202: accepted, not completed.  The page polls GET /network.
+    response.status = 202;
+    JsonObject out = response.body.to<JsonObject>();
+    out["accepted"] = true;
+    out["state"] = toString(s_.network->status().state);
+    return;
+  }
+
+  // --- DELETE /network/config -----------------------------------------------
+  if (path.count() >= 4 && path.is(3, "config")) {
+    if (request.method != HttpMethod::kDelete) {
+      response.setError(405, fail(ErrorCode::kNotSupported, "use DELETE"));
+      return;
+    }
+    if (!requireWriteAccess(request, response)) return;
+    const Status cleared = s_.network->clearCredentials();
+    if (!cleared.ok()) {
+      response.setError(cleared);
+      return;
+    }
+    const NetworkStatus status = s_.network->status();
+    JsonObject out = response.body.to<JsonObject>();
+    out["cleared"] = true;
+    out["state"] = toString(status.state);
+    // The address the operator has to move to, in the same answer that told
+    // them the old one is going away.
+    out["ip"] = jsonCopy(status.accessPointIp.empty() ? "192.168.4.1"
+                                                      : status.accessPointIp.c_str());
+    out["ssid"] = jsonCopy(status.accessPointSsid.c_str());
+    return;
+  }
+
+  // --- PUT /network/hostname ------------------------------------------------
+  if (path.count() >= 4 && path.is(3, "hostname")) {
+    if (request.method != HttpMethod::kPut) {
+      response.setError(405, fail(ErrorCode::kNotSupported, "use PUT"));
+      return;
+    }
+    if (!requireWriteAccess(request, response)) return;
+    JsonDocument body;
+    if (!parseBody(request, body, response)) return;
+    const char* hostname = body["hostname"] | "";
+    // Validated against the SAME predicate the firmware uses, so the API can
+    // never accept a name mDNS will then refuse.
+    if (!INetworkManager::hostnameIsValid(hostname)) {
+      response.setError(fail(ErrorCode::kInvalidArgument,
+                             "1-31 characters of a-z, 0-9 and '-', not "
+                             "starting or ending with '-'"));
+      response.body["error"]["field"] = "hostname";
+      return;
+    }
+    const Status applied = s_.network->setHostname(hostname);
+    if (!applied.ok()) {
+      response.setError(applied);
+      return;
+    }
+    JsonObject out = response.body.to<JsonObject>();
+    out["hostname"] = jsonCopy(hostname);
+    return;
+  }
+
+  // --- GET /network ---------------------------------------------------------
+  if (path.count() != 3) {
+    response.setError(404, fail(ErrorCode::kNotFound, "network endpoint"));
+    return;
+  }
+  if (request.method != HttpMethod::kGet) {
+    response.setError(405, fail(ErrorCode::kNotSupported, "use GET"));
+    return;
+  }
+  serializeNetwork(*s_.network, response.body.to<JsonObject>());
 }
 
 }  // namespace lc

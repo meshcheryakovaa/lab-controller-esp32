@@ -1020,6 +1020,89 @@ await deleteButton.click();
 await page.waitForTimeout(1000);
 console.log('  the set was deleted only after its name was typed');
 
+// --- Milestone 16: joining the house network -----------------------------
+//
+// The whole point of ADR-0022 is what happens when the password is WRONG, so
+// this drives that path first and checks the instrument is still reachable.
+await nav('Network').click();
+await page.waitForSelector('.card');
+await page.waitForTimeout(400);
+await shot('62-network-access-point');
+
+// Scan, and pick the strongest network from the list.
+await page.getByRole('button', { name: 'Find networks' }).click();
+await page.waitForSelector('.networks li', { timeout: 15000 });
+await page.waitForTimeout(300);
+await shot('63-network-scan');
+
+await page.locator('.networks button').first().click();
+
+// A wrong password.  The fake controller rejects anything but "password".
+await page.locator('.password input').fill('definitely-wrong');
+await page.getByRole('button', { name: 'Test and connect' }).click();
+await page.waitForTimeout(5000);
+
+{
+  const state = await page.evaluate(async () => {
+    const response = await fetch('/api/v1/network', { credentials: 'same-origin' });
+    return response.json();
+  });
+  // The failure must be visible AND harmless: the access point is still up, so
+  // the operator has not lost the page they are reading this on.
+  if (!state.access_point.active) {
+    throw new Error('the fallback access point went away after a failed join');
+  }
+  console.log(`  wrong password: ${state.state}, `
+            + `AP still at ${state.access_point.ip}`);
+}
+await shot('64-network-wrong-password');
+
+// Now the right one.
+await page.locator('.password input').fill('password');
+await page.getByRole('button', { name: 'Test and connect' }).click();
+await page.waitForTimeout(5000);
+
+{
+  const state = await page.evaluate(async () => {
+    const response = await fetch('/api/v1/network', { credentials: 'same-origin' });
+    return response.json();
+  });
+  if (state.state !== 'STA_CONNECTED') {
+    throw new Error(`expected STA_CONNECTED, got ${state.state}`);
+  }
+  // Both ways in are offered.  A page that only gave the .local name would be
+  // unreachable from any machine that cannot resolve mDNS.
+  const links = await page.locator('dd a').allTextContents();
+  const hasIp = links.some((text) => text.includes(state.station.ip));
+  const hasMdns = links.some((text) => text.includes(state.hostname));
+  if (!hasIp || !hasMdns) {
+    throw new Error(`expected both the IP and the .local name as links, got ${links}`);
+  }
+  console.log(`  connected: ${state.ssid} at ${state.station.ip} `
+            + `and ${state.mdns}`);
+}
+await shot('65-network-connected');
+
+// And the password is nowhere in what the device will tell anybody.
+{
+  const leaked = await page.evaluate(async () => {
+    const found = [];
+    for (const route of ['/api/v1/network', '/api/v1/diagnostics',
+                         '/api/v1/config/export']) {
+      const response = await fetch(route, { credentials: 'same-origin' });
+      const text = await response.text();
+      if (text.includes('definitely-wrong') || text.includes('"password"')) {
+        found.push(route);
+      }
+    }
+    return found;
+  });
+  if (leaked.length > 0) {
+    throw new Error(`a Wi-Fi password reached ${leaked.join(', ')}`);
+  }
+  console.log('  no Wi-Fi password in /network, /diagnostics or the export');
+}
+
 // --- Milestone 11: the lock that never locks the stop button --------------
 await nav('System').click();
 await page.waitForSelector('.panel');

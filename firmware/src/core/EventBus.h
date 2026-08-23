@@ -48,6 +48,10 @@ enum class EventType : std::uint8_t {
   // nudge — the client re-reads the queue over REST regardless, so a dropped
   // frame delays a transfer and can never lose one.
   kLogSegmentReady,
+  // M16: the network moved between AP, connecting, connected and fallback.
+  // A notification only — the page re-reads GET /network, which stays the
+  // source of truth, so a dropped frame delays a refresh and never misleads.
+  kNetworkStateChanged,
   kSystemMessage,
 
   kCount  // keep last; must stay <= 32 (mask is a uint32)

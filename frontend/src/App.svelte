@@ -10,6 +10,7 @@
   import DashboardView from './views/DashboardView.svelte';
   import DiagnosticsView from './views/DiagnosticsView.svelte';
   import HardwareView from './views/HardwareView.svelte';
+  import NetworkView from './views/NetworkView.svelte';
   import SystemView from './views/SystemView.svelte';
   import LocalDataView from './views/LocalDataView.svelte';
   import LocalRecordingStatus from './components/LocalRecordingStatus.svelte';
@@ -26,6 +27,10 @@
     // on the controller and survive a closed browser; these are on this device
     // and do not.  Filing them together would blur exactly that difference.
     { id: 'local', label: 'Local data' },
+    // M16.  Next to System rather than inside it: connectivity is the one
+    // setting that can put the instrument out of reach, and burying it a level
+    // down is not where somebody looks when they cannot find the device.
+    { id: 'network', label: 'Network' },
     { id: 'system', label: 'System' },
     { id: 'diagnostics', label: 'Diagnostics' },
   ] as const;
@@ -234,6 +239,8 @@
       <LogsView />
     {:else if active === 'local'}
       <LocalDataView />
+    {:else if active === 'network'}
+      <NetworkView />
     {:else if active === 'system'}
       <SystemView />
     {:else}

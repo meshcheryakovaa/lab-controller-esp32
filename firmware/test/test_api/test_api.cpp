@@ -51,6 +51,84 @@ class FakeSink final : public IWebSocketSink {
   }
 };
 
+
+/**
+ * A network manager with no radio (M16).
+ *
+ * Everything worth testing about /network is policy, not physics: that a
+ * password never comes back, that a second connect attempt is refused, that a
+ * hostname is validated.  This fake makes those ordinary host assertions, and
+ * records the password purely so a test can prove the API never returns it.
+ */
+class FakeNetworkManager final : public INetworkManager {
+ public:
+  NetworkStatus state;
+  ScanState scan = ScanState::kIdle;
+  std::vector<NetworkCandidate> candidates;
+  // What was handed to testCredentials().  Present so a test can assert the
+  // secret reached the manager and still never appears in any response.
+  std::string lastSsid;
+  std::string lastPassword;
+  int connectCalls = 0;
+  int clearCalls = 0;
+  bool busy = false;
+
+  FakeNetworkManager() {
+    state.state = NetworkState::kApOnly;
+    state.accessPointActive = true;
+    state.accessPointSsid.assign("LAB-CONTROLLER-A1B2C3");
+    state.accessPointIp.assign("192.168.4.1");
+    state.hostname.assign("lab-controller-a1b2c3");
+  }
+
+  NetworkStatus status() const override { return state; }
+
+  Status beginScan() override {
+    if (busy) return fail(ErrorCode::kResourceBusy, "busy");
+    scan = ScanState::kComplete;
+    return ok();
+  }
+  ScanState scanState() const override { return scan; }
+  std::size_t scanResults(NetworkCandidate* out,
+                          std::size_t capacity) const override {
+    const std::size_t count =
+        candidates.size() < capacity ? candidates.size() : capacity;
+    for (std::size_t i = 0; i < count; ++i) out[i] = candidates[i];
+    return count;
+  }
+
+  Status testCredentials(const char* ssid, const char* password) override {
+    if (busy) {
+      return fail(ErrorCode::kResourceBusy, "a connection test is running");
+    }
+    ++connectCalls;
+    lastSsid = ssid != nullptr ? ssid : "";
+    lastPassword = password != nullptr ? password : "";
+    busy = true;
+    state.state = NetworkState::kStationConnecting;
+    state.testing = true;
+    return ok();
+  }
+
+  Status clearCredentials() override {
+    ++clearCalls;
+    state = NetworkStatus{};
+    state.state = NetworkState::kApOnly;
+    state.accessPointActive = true;
+    state.accessPointIp.assign("192.168.4.1");
+    state.accessPointSsid.assign("LAB-CONTROLLER-A1B2C3");
+    return ok();
+  }
+
+  Status setHostname(const char* hostname) override {
+    if (!INetworkManager::hostnameIsValid(hostname)) {
+      return fail(ErrorCode::kInvalidArgument, "bad hostname");
+    }
+    state.hostname.assign(hostname);
+    return ok();
+  }
+};
+
 int g_rebootCalls = 0;
 void countReboot(void*) { ++g_rebootCalls; }
 
@@ -89,6 +167,7 @@ struct ApiRig {
   platform::HostBusProvider buses;
   SystemManager system{makeSystemServices()};
   RestApi api{makeApiServices()};
+  FakeNetworkManager network;
   FakeSink sink;
   TelemetryBatcher telemetry{channels, clock};
 
@@ -142,6 +221,7 @@ struct ApiRig {
     services.applier = &applier;
     services.system = &system;
     services.metrics = &metrics;
+    services.network = &network;
     services.buses = &buses;
     services.reboot = countReboot;
     return services;
@@ -2867,6 +2947,226 @@ static void test_a_locked_instrument_still_stops_and_will_not_be_reflashed_mid_r
   TEST_ASSERT_EQUAL_STRING("NOT_SUPPORTED", confirmed.body["error"]["code"]);
 }
 
+
+// ===========================================================================
+//  Milestone 16 — the house network over REST.
+//
+//  ADR-0022 in test form: changing the network must never make the instrument
+//  unreachable, and the password must never come back out.
+// ===========================================================================
+
+static void test_the_wifi_password_never_appears_in_any_response() {
+  ApiRig rig;
+  prepareRig(rig);
+  rig.signIn();
+
+  rig.network.state.configured = true;
+  rig.network.state.ssid.assign("HomeWiFi");
+  rig.network.state.state = NetworkState::kStationConnected;
+  rig.network.state.stationConnected = true;
+  rig.network.state.stationIp.assign("192.168.1.74");
+  rig.network.state.rssi = -57;
+
+  const ApiResponse status = rig.get("/api/v1/network");
+  TEST_ASSERT_EQUAL_INT(200, status.status);
+  TEST_ASSERT_EQUAL_STRING("STA_CONNECTED", status.body["state"]);
+  TEST_ASSERT_EQUAL_STRING("HomeWiFi", status.body["ssid"]);
+  TEST_ASSERT_TRUE(status.body["password_set"].as<bool>());
+  TEST_ASSERT_EQUAL_STRING("192.168.1.74", status.body["station"]["ip"]);
+  // The address that works AND the friendly name — never only the name, which
+  // plenty of machines cannot resolve.
+  TEST_ASSERT_EQUAL_STRING("lab-controller-a1b2c3.local", status.body["mdns"]);
+
+  // Send a real password through, then look for it everywhere it could surface.
+  const ApiResponse accepted = rig.post("/api/v1/network/connect",
+      R"({"ssid":"HomeWiFi","password":"super-secret-8"})");
+  TEST_ASSERT_EQUAL_INT(202, accepted.status);
+  TEST_ASSERT_EQUAL_STRING("super-secret-8", rig.network.lastPassword.c_str());
+
+  for (const char* route : {"/api/v1/network", "/api/v1/diagnostics",
+                            "/api/v1/config/export"}) {
+    std::string text;
+    serializeJson(rig.get(route).body, text);
+    TEST_ASSERT_TRUE(text.find("super-secret-8") == std::string::npos);
+    TEST_ASSERT_TRUE(text.find("\"password\"") == std::string::npos);
+  }
+}
+
+static void test_connect_answers_immediately_and_refuses_a_second_attempt() {
+  ApiRig rig;
+  prepareRig(rig);
+  rig.signIn();
+
+  // 202, not 200: accepted, not finished.  A handler that waited for the join
+  // would stall the very poll the page uses to watch for the result.
+  const ApiResponse first = rig.post("/api/v1/network/connect",
+      R"({"ssid":"HomeWiFi","password":"good-password"})");
+  TEST_ASSERT_EQUAL_INT(202, first.status);
+  TEST_ASSERT_TRUE(first.body["accepted"].as<bool>());
+  TEST_ASSERT_EQUAL_STRING("STA_CONNECTING", first.body["state"]);
+  TEST_ASSERT_EQUAL_INT(1, rig.network.connectCalls);
+
+  // A second attempt while one is in flight is a conflict, not a bad request:
+  // trampling the first one's pending credentials is how a working network
+  // gets lost.
+  const ApiResponse second = rig.post("/api/v1/network/connect",
+      R"({"ssid":"Other","password":"another-one"})");
+  TEST_ASSERT_EQUAL_INT(409, second.status);
+  TEST_ASSERT_EQUAL_INT(1, rig.network.connectCalls);
+}
+
+static void test_bad_network_requests_are_refused_before_the_radio() {
+  ApiRig rig;
+  prepareRig(rig);
+  rig.signIn();
+
+  const ApiResponse empty =
+      rig.post("/api/v1/network/connect", R"({"ssid":""})");
+  TEST_ASSERT_TRUE(empty.isError());
+  TEST_ASSERT_EQUAL_STRING("ssid", empty.body["error"]["field"]);
+
+  std::string longSsid(40, 'x');
+  const ApiResponse tooLong = rig.post("/api/v1/network/connect",
+      (std::string(R"({"ssid":")") + longSsid + R"("})").c_str());
+  TEST_ASSERT_EQUAL_INT(413, tooLong.status);
+
+  // WPA2 will not take a shorter key, so refusing here turns a fifteen-second
+  // timeout into an immediate, specific answer.
+  const ApiResponse shortPassword = rig.post("/api/v1/network/connect",
+      R"({"ssid":"HomeWiFi","password":"short"})");
+  TEST_ASSERT_TRUE(shortPassword.isError());
+  TEST_ASSERT_EQUAL_STRING("password", shortPassword.body["error"]["field"]);
+
+  // An open network legitimately has no password.
+  const ApiResponse open =
+      rig.post("/api/v1/network/connect", R"({"ssid":"OpenNet"})");
+  TEST_ASSERT_EQUAL_INT(202, open.status);
+
+  TEST_ASSERT_EQUAL_INT(1, rig.network.connectCalls);
+}
+
+static void test_changing_the_network_needs_the_right_to_change_settings() {
+  ApiRig rig;
+  prepareRig(rig);
+
+  // A password exists and nobody is signed in.  Setting one ends every session,
+  // including the one that set it, so this leaves the rig genuinely signed out.
+  TEST_ASSERT_EQUAL_INT(200, rig.post("/api/v1/auth/password",
+      R"({"password":"bench-password"})").status);
+
+  // Reading is fine; rearranging the instrument's connectivity is not — it is
+  // the one setting that can put the device out of reach.
+  TEST_ASSERT_EQUAL_INT(200, rig.get("/api/v1/network").status);
+
+  TEST_ASSERT_EQUAL_INT(401, rig.post("/api/v1/network/connect",
+      R"({"ssid":"HomeWiFi","password":"good-password"})").status);
+  TEST_ASSERT_EQUAL_INT(401,
+      rig.call(HttpMethod::kDelete, "/api/v1/network/config", "", "").status);
+  TEST_ASSERT_EQUAL_INT(401, rig.call(HttpMethod::kPut,
+      "/api/v1/network/hostname", "", R"({"hostname":"lab-reactor"})").status);
+
+  TEST_ASSERT_EQUAL_INT(0, rig.network.connectCalls);
+  TEST_ASSERT_EQUAL_INT(0, rig.network.clearCalls);
+}
+
+static void test_a_hostname_is_validated_the_same_way_everywhere() {
+  ApiRig rig;
+  prepareRig(rig);
+  rig.signIn();
+
+  const char* refused[] = {"", "-leading", "trailing-", "Upper", "has space",
+                           "has.dot", "has_underscore",
+                           "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"};
+  for (const char* name : refused) {
+    char body[96];
+    std::snprintf(body, sizeof(body), R"({"hostname":"%s"})", name);
+    const ApiResponse response =
+        rig.call(HttpMethod::kPut, "/api/v1/network/hostname", "", body);
+    TEST_ASSERT_TRUE(response.isError());
+    TEST_ASSERT_EQUAL_STRING("hostname", response.body["error"]["field"]);
+    // And the predicate the API used is the one the firmware uses, so the two
+    // cannot drift into disagreeing about what mDNS will accept.
+    TEST_ASSERT_FALSE(INetworkManager::hostnameIsValid(name));
+  }
+
+  const ApiResponse accepted = rig.call(HttpMethod::kPut,
+      "/api/v1/network/hostname", "", R"({"hostname":"lab-reactor-2"})");
+  TEST_ASSERT_EQUAL_INT(200, accepted.status);
+  TEST_ASSERT_EQUAL_STRING("lab-reactor-2", accepted.body["hostname"]);
+  TEST_ASSERT_TRUE(INetworkManager::hostnameIsValid("lab-reactor-2"));
+}
+
+static void test_forgetting_the_network_says_where_to_find_the_device() {
+  ApiRig rig;
+  prepareRig(rig);
+  rig.signIn();
+  rig.network.state.configured = true;
+  rig.network.state.ssid.assign("HomeWiFi");
+
+  const ApiResponse cleared =
+      rig.call(HttpMethod::kDelete, "/api/v1/network/config", "", "");
+  TEST_ASSERT_EQUAL_INT(200, cleared.status);
+  TEST_ASSERT_TRUE(cleared.body["cleared"].as<bool>());
+  TEST_ASSERT_EQUAL_INT(1, rig.network.clearCalls);
+  // The answer carries the address the operator has to move to.  Telling them
+  // the old one is gone without saying where the new one is would be the same
+  // as making the instrument unreachable.
+  TEST_ASSERT_EQUAL_STRING("AP_ONLY", cleared.body["state"]);
+  TEST_ASSERT_EQUAL_STRING("192.168.4.1", cleared.body["ip"]);
+  TEST_ASSERT_EQUAL_STRING("LAB-CONTROLLER-A1B2C3", cleared.body["ssid"]);
+}
+
+static void test_a_scan_reports_what_it_found_and_does_not_restart_itself() {
+  ApiRig rig;
+  prepareRig(rig);
+  rig.signIn();
+
+  NetworkCandidate strong;
+  strong.ssid.assign("HomeWiFi");
+  strong.rssi = -48;
+  strong.channel = 6;
+  strong.secured = true;
+  NetworkCandidate weak;
+  weak.ssid.assign("Guest");
+  weak.rssi = -71;
+  weak.channel = 11;
+  weak.secured = true;
+  rig.network.candidates = {strong, weak};
+
+  TEST_ASSERT_EQUAL_INT(200, rig.post("/api/v1/network/scan", "").status);
+
+  const ApiResponse results = rig.get("/api/v1/network/scan");
+  TEST_ASSERT_EQUAL_INT(200, results.status);
+  TEST_ASSERT_EQUAL_STRING("COMPLETE", results.body["state"]);
+  TEST_ASSERT_EQUAL_UINT(2, results.body["networks"].size());
+  TEST_ASSERT_EQUAL_STRING("HomeWiFi", results.body["networks"][0]["ssid"]);
+  TEST_ASSERT_EQUAL_INT(-48, results.body["networks"][0]["rssi"].as<int>());
+  TEST_ASSERT_TRUE(results.body["networks"][0]["secured"].as<bool>());
+
+  // Scanning while a connection is being proved would take the radio away from
+  // the attempt the operator is waiting on.
+  rig.network.busy = true;
+  TEST_ASSERT_EQUAL_INT(409, rig.post("/api/v1/network/scan", "").status);
+}
+
+static void test_a_build_without_a_radio_says_so_rather_than_pretending() {
+  ApiRig rig;
+  prepareRig(rig);
+  rig.signIn();
+  // A host build, or a board with no Wi-Fi.  Reporting a network nobody can
+  // configure would be worse than admitting there is none.
+  RestApi::Services withoutRadio = rig.makeApiServices();
+  withoutRadio.network = nullptr;
+  RestApi bare(withoutRadio);
+
+  ApiRequest incoming;
+  incoming.method = HttpMethod::kGet;
+  incoming.path = "/api/v1/network";
+  ApiResponse outgoing;
+  bare.handle(incoming, outgoing);
+  TEST_ASSERT_EQUAL_INT(501, outgoing.status);
+}
+
 int main(int, char**) {
   UNITY_BEGIN();
   RUN_TEST(test_path_is_split_into_segments);
@@ -2952,5 +3252,13 @@ int main(int, char**) {
   RUN_TEST(test_the_password_never_leaves_in_an_export);
   RUN_TEST(test_an_import_is_confirmed_and_keeps_what_it_replaced);
   RUN_TEST(test_a_locked_instrument_still_stops_and_will_not_be_reflashed_mid_run);
+  RUN_TEST(test_the_wifi_password_never_appears_in_any_response);
+  RUN_TEST(test_connect_answers_immediately_and_refuses_a_second_attempt);
+  RUN_TEST(test_bad_network_requests_are_refused_before_the_radio);
+  RUN_TEST(test_changing_the_network_needs_the_right_to_change_settings);
+  RUN_TEST(test_a_hostname_is_validated_the_same_way_everywhere);
+  RUN_TEST(test_forgetting_the_network_says_where_to_find_the_device);
+  RUN_TEST(test_a_scan_reports_what_it_found_and_does_not_restart_itself);
+  RUN_TEST(test_a_build_without_a_radio_says_so_rather_than_pretending);
   return UNITY_END();
 }

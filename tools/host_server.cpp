@@ -46,6 +46,7 @@
 #include <fstream>
 #include <mutex>
 #include <sstream>
+#include <chrono>
 #include <string>
 #include <thread>
 #include <vector>
@@ -84,6 +85,142 @@ class HostSystemMetrics final : public NullSystemMetrics {
   char id_[16] = {0};
 };
 
+
+// ---------------------------------------------------------------------------
+//  A network manager with no radio, so the M16 page can be driven on a PC.
+//
+//  It models the parts that matter to the interface and to ADR-0022: a join
+//  takes time (so "connecting" is a state the page has to render, not a blink),
+//  a wrong password fails without disturbing the stored network, and the
+//  fallback access point never goes away while an attempt is in flight.
+//
+//  The password is kept only so the fake can decide whether the join succeeds.
+//  It is never handed back — like the real one, NetworkStatus has no field for
+//  it.
+// ---------------------------------------------------------------------------
+class HostNetworkManager final : public lc::INetworkManager {
+ public:
+  HostNetworkManager() {
+    status_.state = lc::NetworkState::kApOnly;
+    status_.accessPointActive = true;
+    status_.accessPointSsid.assign("LAB-CONTROLLER-A1B2C3");
+    status_.accessPointIp.assign("192.168.4.1");
+    status_.hostname.assign("lab-controller-a1b2c3");
+  }
+
+  lc::NetworkStatus status() const override {
+    std::lock_guard<std::mutex> held(mutex_);
+    if (status_.testing) {
+      const auto elapsed = std::chrono::steady_clock::now() - startedAt_;
+      if (elapsed >= std::chrono::seconds(3)) {
+        // "password" is the fake's shared secret; anything else times out, so
+        // the failure path is reachable from the interface on a PC.
+        if (pendingPassword_ == "password" || pendingPassword_.empty()) {
+          status_.testing = false;
+          status_.configured = true;
+          status_.ssid = pendingSsid_;
+          status_.state = lc::NetworkState::kStationConnected;
+          status_.stationConnected = true;
+          status_.stationIp.assign("192.168.1.74");
+          status_.rssi = -57;
+          ++status_.reconnects;
+        } else {
+          status_.testing = false;
+          status_.state = status_.configured
+              ? lc::NetworkState::kApStationFallback : lc::NetworkState::kApOnly;
+          // The station really is down, so every field that describes it has to
+          // say so.  Leaving a stale address behind produced a card that showed
+          // AP_STA_FALLBACK and a live IP at the same time — a real controller
+          // reports WiFi.status() != WL_CONNECTED and none of these.
+          status_.stationConnected = false;
+          status_.stationIp.assign("");
+          status_.rssi = 0;
+          status_.lastError = lc::fail(lc::ErrorCode::kTimeout,
+              "could not join that network; check the password");
+        }
+      }
+    }
+    return status_;
+  }
+
+  lc::Status beginScan() override {
+    std::lock_guard<std::mutex> held(mutex_);
+    if (status_.testing) {
+      return lc::fail(lc::ErrorCode::kResourceBusy, "a connection test is running");
+    }
+    scan_ = lc::ScanState::kComplete;
+    return lc::ok();
+  }
+  lc::ScanState scanState() const override { return scan_; }
+
+  std::size_t scanResults(lc::NetworkCandidate* out,
+                          std::size_t capacity) const override {
+    static const struct { const char* ssid; int rssi; int channel; bool secured; }
+        kFound[] = {
+          {"HomeWiFi", -48, 6, true},
+          {"Lab-5GHz", -61, 36, true},
+          {"Guest", -71, 11, true},
+          {"neighbour-2.4", -83, 1, true},
+        };
+    const std::size_t count =
+        (sizeof(kFound) / sizeof(kFound[0])) < capacity
+            ? (sizeof(kFound) / sizeof(kFound[0])) : capacity;
+    for (std::size_t i = 0; i < count; ++i) {
+      out[i].ssid.assign(kFound[i].ssid);
+      out[i].rssi = kFound[i].rssi;
+      out[i].channel = static_cast<std::uint8_t>(kFound[i].channel);
+      out[i].secured = kFound[i].secured;
+    }
+    return count;
+  }
+
+  lc::Status testCredentials(const char* ssid, const char* password) override {
+    std::lock_guard<std::mutex> held(mutex_);
+    if (status_.testing) {
+      return lc::fail(lc::ErrorCode::kResourceBusy,
+                      "a connection test is already running");
+    }
+    pendingSsid_.assign(ssid);
+    pendingPassword_ = password != nullptr ? password : "";
+    startedAt_ = std::chrono::steady_clock::now();
+    status_.testing = true;
+    status_.state = lc::NetworkState::kStationConnecting;
+    status_.lastError = lc::Error{};
+    // The access point stays up throughout — that is the promise being modelled.
+    status_.accessPointActive = true;
+    return lc::ok();
+  }
+
+  lc::Status clearCredentials() override {
+    std::lock_guard<std::mutex> held(mutex_);
+    const lc::FixedString<lc::kHostnameLength> keptHostname = status_.hostname;
+    status_ = lc::NetworkStatus{};
+    status_.state = lc::NetworkState::kApOnly;
+    status_.accessPointActive = true;
+    status_.accessPointSsid.assign("LAB-CONTROLLER-A1B2C3");
+    status_.accessPointIp.assign("192.168.4.1");
+    status_.hostname = keptHostname;
+    return lc::ok();
+  }
+
+  lc::Status setHostname(const char* hostname) override {
+    if (!lc::INetworkManager::hostnameIsValid(hostname)) {
+      return lc::fail(lc::ErrorCode::kInvalidArgument, "bad hostname");
+    }
+    std::lock_guard<std::mutex> held(mutex_);
+    status_.hostname.assign(hostname);
+    return lc::ok();
+  }
+
+ private:
+  mutable std::mutex mutex_;
+  mutable lc::NetworkStatus status_;
+  lc::ScanState scan_ = lc::ScanState::kIdle;
+  lc::FixedString<lc::kSsidLength> pendingSsid_;
+  std::string pendingPassword_;
+  std::chrono::steady_clock::time_point startedAt_;
+};
+
 struct Rig {
   // Declared first so `metrics` below can be initialised from it: members are
   // constructed in declaration order, and reading one that is not yet built is
@@ -113,6 +250,7 @@ struct Rig {
   AuthManager auth{clock, random, backend, events};
   ConfigApplier applier{devices, processing, channels, &calibrations};
   HostSystemMetrics metrics{root};
+  HostNetworkManager network;
   platform::HostBusProvider buses;
   SystemManager system;
   RestApi api;
@@ -175,6 +313,7 @@ struct Rig {
     services.applier = &applier;
     services.system = &system;
     services.metrics = &metrics;
+    services.network = &network;
     services.buses = &buses;
     return services;
   }

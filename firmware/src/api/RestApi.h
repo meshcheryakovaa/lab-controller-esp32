@@ -23,6 +23,7 @@
 #include "buses/IBusProvider.h"
 #include "core/ModuleRegistry.h"
 #include "services/AuthManager.h"
+#include "services/INetworkManager.h"
 #include "services/DeviceManager.h"
 #include "services/ProcessingManager.h"
 #include "storage/ConfigApplier.h"
@@ -58,6 +59,10 @@ class RestApi {
     SystemManager* system = nullptr;
     IBusProvider* buses = nullptr;
     const ISystemMetrics* metrics = nullptr;
+    // M16.  Optional: a build without a radio simply has no /network routes,
+    // which is honest — the alternative is an endpoint that reports a network
+    // nobody can configure.
+    INetworkManager* network = nullptr;
 
     // Called by POST /system/reboot.  Injected so a test can assert the request
     // was accepted without the test process exiting.
@@ -99,6 +104,7 @@ class RestApi {
   void handleAuth(const ApiRequest&, const PathSegments&, ApiResponse&);
   void handleFirmware(const ApiRequest&, const PathSegments&, ApiResponse&);
   void handleConfig(const ApiRequest&, const PathSegments&, ApiResponse&);
+  void handleNetwork(const ApiRequest&, const PathSegments&, ApiResponse&);
 
   // --- experiments ---------------------------------------------------------
   void describeRunState(JsonObject out) const;

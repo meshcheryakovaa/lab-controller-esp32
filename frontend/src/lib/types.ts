@@ -461,3 +461,49 @@ export interface AuthStatus {
   locked: boolean;
   min_password_length?: number;
 }
+
+// ---------------------------------------------------------------------------
+//  M16 — the house network.
+//
+//  There is no `password` field anywhere in here, and that is the point: the
+//  firmware never sends one, so the type that describes its answer must not
+//  have a place to put one.  `passwordSet` answers the only question the
+//  interface actually needs — is a password remembered — without carrying it.
+// ---------------------------------------------------------------------------
+
+export type NetworkState =
+  | 'OFF' | 'AP_ONLY' | 'STA_CONNECTING' | 'STA_CONNECTED'
+  | 'AP_STA_FALLBACK' | 'NETWORK_ERROR';
+
+export type ScanState = 'IDLE' | 'SCANNING' | 'COMPLETE' | 'FAILED';
+
+export interface NetworkStatus {
+  state: NetworkState;
+  configured: boolean;
+  ssid: string;
+  password_set: boolean;
+  hostname: string;
+  /** "lab-controller-a1b2c3.local" — offered as well as the IP, never instead
+   *  of it: plenty of machines cannot resolve mDNS. */
+  mdns?: string;
+  /** True while credentials are being proved.  The page polls on this. */
+  pending: boolean;
+  station: { connected: boolean; ip: string; rssi: number };
+  access_point: { active: boolean; ssid: string; ip: string };
+  reconnects: number;
+  disconnects: number;
+  last_disconnect_reason: string;
+  last_error: { code: string; detail: string } | null;
+}
+
+export interface NetworkCandidate {
+  ssid: string;
+  rssi: number;
+  channel: number;
+  secured: boolean;
+}
+
+export interface NetworkScan {
+  state: ScanState;
+  networks: NetworkCandidate[];
+}

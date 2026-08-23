@@ -26,6 +26,7 @@ const char* toString(EventType type) {
     case EventType::kProfileActivated:     return "PROFILE_ACTIVATED";
     case EventType::kLoggingStarted:       return "LOGGING_STARTED";
     case EventType::kLoggingStopped:       return "LOGGING_STOPPED";
+    case EventType::kNetworkStateChanged: return "NETWORK_STATE_CHANGED";
     case EventType::kLogSegmentReady:      return "LOG_SEGMENT_READY";
     case EventType::kSystemMessage:        return "SYSTEM_MESSAGE";
     case EventType::kCount:                break;
