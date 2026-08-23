@@ -10,6 +10,7 @@
   import DashboardView from './views/DashboardView.svelte';
   import DiagnosticsView from './views/DiagnosticsView.svelte';
   import HardwareView from './views/HardwareView.svelte';
+  import CloudView from './views/CloudView.svelte';
   import NetworkView from './views/NetworkView.svelte';
   import SystemView from './views/SystemView.svelte';
   import LocalDataView from './views/LocalDataView.svelte';
@@ -31,6 +32,9 @@
     // setting that can put the instrument out of reach, and burying it a level
     // down is not where somebody looks when they cannot find the device.
     { id: 'network', label: 'Network' },
+    // M17.  Next to Network, because that is what it depends on: the uploader
+    // will not attempt anything until the controller is on a real router.
+    { id: 'cloud', label: 'Cloud' },
     { id: 'system', label: 'System' },
     { id: 'diagnostics', label: 'Diagnostics' },
   ] as const;
@@ -241,6 +245,8 @@
       <LocalDataView />
     {:else if active === 'network'}
       <NetworkView />
+    {:else if active === 'cloud'}
+      <CloudView />
     {:else if active === 'system'}
       <SystemView />
     {:else}

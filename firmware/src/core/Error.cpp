@@ -57,6 +57,14 @@ const char* errorSymbol(ErrorCode code) {
     case ErrorCode::kForbidden:         return "FORBIDDEN";
     case ErrorCode::kPayloadTooLarge:   return "PAYLOAD_TOO_LARGE";
     case ErrorCode::kRateLimited:       return "RATE_LIMITED";
+    case ErrorCode::kCloudNotConfigured:    return "CLOUD_NOT_CONFIGURED";
+    case ErrorCode::kCloudUnauthorized:     return "CLOUD_UNAUTHORIZED";
+    case ErrorCode::kCloudAuthRevoked:      return "CLOUD_AUTH_REVOKED";
+    case ErrorCode::kCloudQuotaExceeded:    return "CLOUD_QUOTA_EXCEEDED";
+    case ErrorCode::kCloudChecksumMismatch: return "CLOUD_CHECKSUM_MISMATCH";
+    case ErrorCode::kCloudRemoteConflict:   return "CLOUD_REMOTE_CONFLICT";
+    case ErrorCode::kCloudUntrustedHost:    return "CLOUD_UNTRUSTED_UPLOAD_URL";
+    case ErrorCode::kCloudTransient:        return "CLOUD_TRANSIENT";
   }
   return "UNKNOWN";
 }

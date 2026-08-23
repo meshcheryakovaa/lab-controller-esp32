@@ -347,6 +347,115 @@ PUT /api/v1/network/hostname
 Сборка без радиомодуля отвечает `501 NOT_SUPPORTED` на все эти маршруты — это
 честнее, чем сообщать о сети, которую нельзя настроить.
 
+### Выгрузка на Яндекс Диск (M17)
+
+Всё под `/api/v1/cloud`. Правило раздела — ADR-0023: локальный файл удаляется
+только после того, как удалённый объект прочитан обратно и совпал по размеру и
+MD5.
+
+```http
+GET /api/v1/cloud
+```
+
+```json
+{
+  "provider": "yandex", "enabled": true, "authorized": true,
+  "configured": true, "clientSecretSet": true,
+  "state": "UPLOADING", "linkState": "AUTHORIZED",
+  "rootPath": "disk:/LabController",
+  "networkReady": true, "timeReady": true,
+  "secureStorage": false,
+  "queue": { "pending": 3, "failed": 0, "acknowledged": 14,
+             "paused": false, "corrupt": false, "jobs": [] },
+  "current": { "jobId": 17, "file": "log_0001_p000001.csv",
+               "sentBytes": 65536, "totalBytes": 101824, "attempt": 1 },
+  "lastError": null
+}
+```
+
+**Ни токена, ни Client Secret здесь нет и быть не может.** В `ICloudAccount`
+отсутствует метод, который мог бы их вернуть, поэтому ни один обработчик не
+способен их сериализовать. `clientSecretSet` отвечает на единственный нужный
+вопрос.
+
+`secureStorage: false` на обычной ESP32 — это не ошибка, а честное сообщение:
+флеш не зашифрован, и интерфейс показывает предупреждение.
+
+`networkReady` и `timeReady` — два условия, которых ждёт загрузчик. Резервная
+точка доступа **не** считается выходом в интернет, а без синхронизированного
+времени сертификат проверить нельзя, и правильный ответ — ждать, а не отключать
+проверку.
+
+Часы ставит SNTP: `WifiManager` запускает синхронизацию в момент, когда станция
+получила адрес (и повторяет при следующем подключении, пока время неправдоподобно
+— первая попытка может прийтись на момент, когда DNS ещё не работает). До этого
+`IClock::epochMillis()` возвращает 0, `timeReady` — `false`, а сегменты копятся
+локально. Серверы: `time.yandex.ru`, `pool.ntp.org`, `time.cloudflare.com`;
+смещение нулевое, потому что все метки времени в прошивке — epoch UTC.
+
+#### Привязка аккаунта
+
+```http
+POST /api/v1/cloud/yandex/device-code
+```
+
+```json
+{"userCode": "ABCD-1234",
+ "verificationUrl": "https://oauth.yandex.ru/device",
+ "expiresIn": 300}
+```
+
+Обработчик **не ждёт**. Опрос Яндекса ведёт сам контроллер на отдельной задаче,
+поэтому привязка завершается даже с закрытой вкладкой — в этом и смысл Device
+Code. Страница опрашивает `GET /api/v1/cloud/yandex/device-code/status`.
+
+Пароль Яндекса в интерфейс контроллера не вводится никогда.
+
+#### Настройка и отключение
+
+```http
+PUT /api/v1/cloud/yandex/config
+{"clientId": "...", "clientSecret": "...",
+ "rootPath": "disk:/LabController", "enabled": true}
+```
+
+Пустой `clientSecret` означает «не менять»: страница не может показать
+сохранённый, и заставлять перенабирать его ради смены папки было бы неверно.
+Удаление — отдельный флаг `clearClientSecret`.
+
+```http
+POST   /api/v1/cloud/yandex/test          проверить доступ, тестовый файл не пишется
+DELETE /api/v1/cloud/yandex/credentials   требует подтверждения паролем
+```
+
+Отключение удаляет реквизиты локально **в любом случае** — даже если отзыв на
+стороне Яндекса не прошёл. Ответ сообщает `revokedRemotely`, чтобы оператор
+знал, нужно ли дополнительно отозвать доступ в аккаунте.
+
+#### Очередь
+
+```http
+GET  /api/v1/cloud/queue
+POST /api/v1/cloud/queue/pause
+POST /api/v1/cloud/queue/resume
+POST /api/v1/cloud/queue/retry    {"jobId": 17}
+```
+
+`retry` принимает **только** `jobId`. Клиент никогда не передаёт локальный путь,
+удалённый путь или upload URL: это указания о том, куда писать чужие измерения,
+и решает их контроллер.
+
+Состояния задания: `PENDING`, `WAITING_NETWORK`, `WAITING_TIME`,
+`REFRESHING_TOKEN`, `CREATING_DIRECTORIES`, `REQUESTING_UPLOAD_URL`,
+`UPLOADING`, `VERIFYING_TEMPORARY`, `MOVING`, `VERIFYING_FINAL`,
+`ACKNOWLEDGED`, `PAUSED_NO_AUTH`, `REMOTE_CONFLICT`, `PERMANENT_ERROR`.
+
+`corrupt: true` в очереди означает, что файл очереди не читается: выгрузка
+остановлена и **ни один CSV не удалён**. `pending: 0` в этом состоянии не значит
+«всё отправлено».
+
+Сборка без облака отвечает `501` на все эти маршруты.
+
 ### Кто это отвечает
 
 `GET /api/v1/system` возвращает `controller_id` — устойчивое имя контроллера

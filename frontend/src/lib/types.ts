@@ -507,3 +507,82 @@ export interface NetworkScan {
   state: ScanState;
   networks: NetworkCandidate[];
 }
+
+// ---------------------------------------------------------------------------
+//  M17 — offloading segments to Yandex Disk.
+//
+//  As with the Wi-Fi password in M16, there is no field here for a client
+//  secret or a token, and that is the point: the firmware has no method that
+//  could return one, so the type describing its answer must not suggest
+//  otherwise.  `clientSecretSet` answers the only question the page has.
+// ---------------------------------------------------------------------------
+
+export type CloudState =
+  | 'DISABLED' | 'IDLE' | 'WAITING_NETWORK' | 'WAITING_TIME'
+  | 'WAITING_AUTHORIZATION' | 'UPLOADING' | 'PAUSED' | 'BLOCKED';
+
+export type CloudLinkState =
+  | 'IDLE' | 'REQUESTING_CODE' | 'WAITING_USER' | 'AUTHORIZED'
+  | 'EXPIRED' | 'FAILED';
+
+export type CloudJobState =
+  | 'PENDING' | 'WAITING_NETWORK' | 'WAITING_TIME' | 'REFRESHING_TOKEN'
+  | 'CREATING_DIRECTORIES' | 'REQUESTING_UPLOAD_URL' | 'UPLOADING'
+  | 'VERIFYING_TEMPORARY' | 'MOVING' | 'VERIFYING_FINAL' | 'ACKNOWLEDGED'
+  | 'PAUSED_NO_AUTH' | 'REMOTE_CONFLICT' | 'PERMANENT_ERROR';
+
+export interface CloudJob {
+  id: number;
+  sessionId: string;
+  segmentId: string;
+  bytes: number;
+  state: CloudJobState;
+  attempts: number;
+  nextAttemptEpochMs: number;
+  remotePath: string;
+  lastError: string | null;
+}
+
+export interface CloudQueue {
+  paused: boolean;
+  corrupt: boolean;
+  error?: string;
+  pending: number;
+  failed: number;
+  acknowledged: number;
+  jobs: CloudJob[];
+}
+
+export interface CloudStatus {
+  provider: string;
+  enabled: boolean;
+  authorized: boolean;
+  configured: boolean;
+  clientSecretSet: boolean;
+  state: CloudState;
+  linkState: CloudLinkState;
+  rootPath: string;
+  /** Both gates the uploader waits on, so the page can say WHY it is idle
+   *  rather than just that it is. */
+  networkReady: boolean;
+  timeReady: boolean;
+  tokenExpiresAt: number;
+  lastSuccessEpochMs: number;
+  /** False on a stock ESP32.  Shown, not hidden — see ADR-0023. */
+  secureStorage: boolean;
+  queue: CloudQueue;
+  current?: {
+    jobId: number;
+    file: string;
+    sentBytes: number;
+    totalBytes: number;
+    attempt: number;
+  };
+  lastError: { code: string; detail: string } | null;
+}
+
+export interface CloudLinkPrompt {
+  userCode: string;
+  verificationUrl: string;
+  expiresIn: number;
+}

@@ -80,6 +80,19 @@ enum class ErrorCode : std::uint16_t {
   kForbidden = 701,
   kPayloadTooLarge = 702,
   kRateLimited = 703,
+
+  // 8xx — cloud offload (M17).  Their own block rather than reusing the
+  // storage codes: "the upload did not match" and "the filesystem failed" send
+  // an operator to completely different places, and a code is supposed to say
+  // which.
+  kCloudNotConfigured = 800,
+  kCloudUnauthorized = 801,      // token missing, expired or refused
+  kCloudAuthRevoked = 802,       // needs the operator to link the account again
+  kCloudQuotaExceeded = 803,
+  kCloudChecksumMismatch = 804,  // stored copy is not the file that was sent
+  kCloudRemoteConflict = 805,    // a DIFFERENT file already occupies the path
+  kCloudUntrustedHost = 806,     // an upload URL outside the provider's domains
+  kCloudTransient = 807,         // DNS, TLS, timeout, 5xx — worth retrying
 };
 
 // Stable UPPER_SNAKE symbol, e.g. "GPIO_ALREADY_IN_USE".  Used verbatim in

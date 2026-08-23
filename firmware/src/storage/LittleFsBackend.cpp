@@ -93,6 +93,26 @@ Result<std::size_t> LittleFsBackend::read(const char* path, char* buffer,
   return read;
 }
 
+Result<std::size_t> LittleFsBackend::readAt(const char* path, std::size_t offset,
+                                            char* buffer,
+                                            std::size_t bytes) const {
+  if (!mounted_) return fail(ErrorCode::kStorageFailure, "not mounted");
+  if (buffer == nullptr || bytes == 0) {
+    return fail(ErrorCode::kInvalidArgument, "no buffer");
+  }
+  File file = LittleFS.open(path, "r");
+  if (!file) return fail(ErrorCode::kNotFound, path);
+  if (!file.seek(offset)) {
+    file.close();
+    // Past the end is "nothing left", not a failure: the uploader walks a file
+    // until a short read, and an error here would abort a finished upload.
+    return static_cast<std::size_t>(0);
+  }
+  const std::size_t read = file.readBytes(buffer, bytes);
+  file.close();
+  return read;
+}
+
 Status LittleFsBackend::append(const char* path, const char* data,
                                std::size_t bytes) {
   if (!mounted_) return fail(ErrorCode::kStorageFailure, "not mounted");

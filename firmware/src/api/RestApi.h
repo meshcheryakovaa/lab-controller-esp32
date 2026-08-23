@@ -23,6 +23,7 @@
 #include "buses/IBusProvider.h"
 #include "core/ModuleRegistry.h"
 #include "services/AuthManager.h"
+#include "services/CloudManager.h"
 #include "services/INetworkManager.h"
 #include "services/DeviceManager.h"
 #include "services/ProcessingManager.h"
@@ -63,6 +64,13 @@ class RestApi {
     // which is honest — the alternative is an endpoint that reports a network
     // nobody can configure.
     INetworkManager* network = nullptr;
+    // M17.  Optional in the same way and for the same reason: a build with no
+    // cloud has no /cloud routes rather than an endpoint describing one.
+    CloudManager* cloud = nullptr;
+    // The account-linking half.  Split from CloudManager on purpose: the
+    // manager decides what to upload, this holds credentials, and the routes
+    // that touch secrets are therefore visibly a different set.
+    ICloudAccount* cloudAccount = nullptr;
 
     // Called by POST /system/reboot.  Injected so a test can assert the request
     // was accepted without the test process exiting.
@@ -105,6 +113,8 @@ class RestApi {
   void handleFirmware(const ApiRequest&, const PathSegments&, ApiResponse&);
   void handleConfig(const ApiRequest&, const PathSegments&, ApiResponse&);
   void handleNetwork(const ApiRequest&, const PathSegments&, ApiResponse&);
+  void handleCloud(const ApiRequest&, const PathSegments&, ApiResponse&);
+  void describeCloud(JsonObject out) const;
 
   // --- experiments ---------------------------------------------------------
   void describeRunState(JsonObject out) const;

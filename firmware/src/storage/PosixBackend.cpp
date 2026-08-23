@@ -66,6 +66,23 @@ Result<std::size_t> PosixBackend::read(const char* path, char* buffer,
   return bytes;
 }
 
+Result<std::size_t> PosixBackend::readAt(const char* path, std::size_t offset,
+                                         char* buffer, std::size_t bytes) const {
+  if (buffer == nullptr || bytes == 0) {
+    return fail(ErrorCode::kInvalidArgument, "no buffer");
+  }
+  FILE* file = std::fopen(absolute(path).c_str(), "rb");
+  if (file == nullptr) return fail(ErrorCode::kNotFound, path);
+  if (std::fseek(file, static_cast<long>(offset), SEEK_SET) != 0) {
+    std::fclose(file);
+    // Seeking past the end is not an error, it is "nothing left".
+    return static_cast<std::size_t>(0);
+  }
+  const std::size_t read = std::fread(buffer, 1, bytes, file);
+  std::fclose(file);
+  return read;
+}
+
 Status PosixBackend::writeAtomic(const char* path, const char* data,
                                  std::size_t bytes) {
   if (freeBytes() < bytes) return fail(ErrorCode::kFilesystemFull, path);

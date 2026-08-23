@@ -27,6 +27,14 @@ const char* toString(EventType type) {
     case EventType::kLoggingStarted:       return "LOGGING_STARTED";
     case EventType::kLoggingStopped:       return "LOGGING_STOPPED";
     case EventType::kNetworkStateChanged: return "NETWORK_STATE_CHANGED";
+    case EventType::kCloudAuthorized:      return "CLOUD_AUTHORIZED";
+    case EventType::kCloudAuthExpired:     return "CLOUD_AUTH_EXPIRED";
+    case EventType::kCloudUploadQueued:    return "CLOUD_UPLOAD_QUEUED";
+    case EventType::kCloudUploadStarted:   return "CLOUD_UPLOAD_STARTED";
+    case EventType::kCloudUploadVerified:  return "CLOUD_UPLOAD_VERIFIED";
+    case EventType::kCloudUploadRetry:     return "CLOUD_UPLOAD_RETRY";
+    case EventType::kCloudUploadConflict:  return "CLOUD_UPLOAD_CONFLICT";
+    case EventType::kCloudUploadFailed:    return "CLOUD_UPLOAD_FAILED";
     case EventType::kLogSegmentReady:      return "LOG_SEGMENT_READY";
     case EventType::kSystemMessage:        return "SYSTEM_MESSAGE";
     case EventType::kCount:                break;

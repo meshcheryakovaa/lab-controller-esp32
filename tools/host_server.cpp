@@ -47,6 +47,7 @@
 #include <mutex>
 #include <sstream>
 #include <chrono>
+#include <map>
 #include <string>
 #include <thread>
 #include <vector>
@@ -57,6 +58,8 @@
 #include "platform/host/HostBusProvider.h"
 #include "platform/host/HostClock.h"
 #include "platform/host/HostRandom.h"
+#include "services/CloudManager.h"
+#include "storage/CloudUploadQueue.h"
 #include "storage/PosixBackend.h"
 
 using namespace lc;
@@ -98,6 +101,124 @@ class HostSystemMetrics final : public NullSystemMetrics {
 //  It is never handed back — like the real one, NetworkStatus has no field for
 //  it.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+//  A cloud account and uploader with no cloud, so the M17 page can be driven
+//  on a PC.  It models the parts the interface has to render: a queue that
+//  drains, a Device Code prompt, and a job that stops with a conflict.
+// ---------------------------------------------------------------------------
+/** A cloud that stores objects in memory, so the M17 page can be exercised. */
+class HostCloudProvider final : public lc::ICloudProvider {
+ public:
+  const char* name() const override { return "yandex"; }
+  bool authorized() const override { return true; }
+  lc::CloudResult refreshAuthorizationIfNeeded() override { return lc::cloudOk(); }
+  lc::CloudResult ensureDirectory(const char*) override { return lc::cloudOk(); }
+  lc::CloudResult stat(const char* path, lc::CloudObjectInfo& out) override {
+    const auto found = objects_.find(path);
+    if (found == objects_.end()) { out = lc::CloudObjectInfo{}; return lc::cloudOk(); }
+    out.exists = true; out.isFile = true;
+    out.size = found->second.first;
+    out.md5.assign(found->second.second.c_str());
+    return lc::cloudOk();
+  }
+  lc::CloudResult upload(const char* remotePath, lc::IStorageBackend& storage,
+                         const char* localPath, std::uint64_t bytes,
+                         lc::ICloudUploadObserver* observer) override {
+    lc::Md5 md5;
+    char buffer[4096];
+    std::size_t offset = 0;
+    while (offset < bytes) {
+      const std::size_t want = static_cast<std::size_t>(
+          (bytes - offset) < sizeof(buffer) ? (bytes - offset) : sizeof(buffer));
+      const lc::Result<std::size_t> read =
+          storage.readAt(localPath, offset, buffer, want);
+      if (!read.ok() || read.value() == 0) break;
+      md5.update(reinterpret_cast<const std::uint8_t*>(buffer), read.value());
+      offset += read.value();
+      if (observer) observer->onUploadProgress(offset, bytes);
+    }
+    char hex[lc::Md5::kTextBytes];
+    md5.finishHex(hex);
+    objects_[remotePath] = {offset, hex};
+    return lc::cloudOk();
+  }
+  lc::CloudResult move(const char* from, const char* to) override {
+    const auto found = objects_.find(from);
+    if (found == objects_.end()) {
+      return lc::cloudFail(lc::CloudFailure::kPermanent, lc::ErrorCode::kNotFound, "gone");
+    }
+    objects_[to] = found->second;
+    objects_.erase(found);
+    return lc::cloudOk();
+  }
+  lc::CloudResult remove(const char* path) override {
+    objects_.erase(path);
+    return lc::cloudOk();
+  }
+ private:
+  std::map<std::string, std::pair<std::uint64_t, std::string>> objects_;
+};
+
+class HostCloudAccount final : public lc::ICloudAccount {
+ public:
+  bool configured() const override { return !clientId_.empty(); }
+  bool clientSecretSet() const override { return !secret_.empty(); }
+  bool authorized() const override {
+    // Settles the pending link first: the status route reads authorized()
+    // before linkState(), and a fake that answered from a stale flag produced a
+    // screenshot claiming "linked" and "not linked yet" at the same time.
+    linkState();
+    return linked_;
+  }
+  lc::EpochMs tokenExpiresAtEpochMs() const override {
+    return linked_ ? 1787482800000ull : 0;
+  }
+  lc::Status setClientId(const char* v) override { clientId_ = v ? v : ""; return lc::ok(); }
+  lc::Status setClientSecret(const char* v) override { secret_ = v ? v : ""; return lc::ok(); }
+  lc::Status clearClientSecret() override { secret_.clear(); return lc::ok(); }
+
+  lc::CloudResult beginLink() override {
+    state_ = lc::CloudLinkState::kWaitingUser;
+    startedAt_ = std::chrono::steady_clock::now();
+    return lc::cloudOk();
+  }
+  lc::CloudLinkState linkState() const override {
+    if (state_ == lc::CloudLinkState::kWaitingUser) {
+      const auto elapsed = std::chrono::steady_clock::now() - startedAt_;
+      // The operator "types the code" after four seconds, so the page's
+      // waiting state is actually visible in a screenshot.
+      if (elapsed >= std::chrono::seconds(4)) {
+        state_ = lc::CloudLinkState::kAuthorized;
+        linked_ = true;
+      }
+    }
+    return state_;
+  }
+  lc::CloudLinkPrompt linkPrompt() const override {
+    lc::CloudLinkPrompt prompt;
+    prompt.userCode.assign("ABCD-1234");
+    prompt.verificationUrl.assign("https://oauth.yandex.ru/device");
+    const auto elapsed = std::chrono::steady_clock::now() - startedAt_;
+    const auto left = std::chrono::seconds(300) -
+        std::chrono::duration_cast<std::chrono::seconds>(elapsed);
+    prompt.secondsRemaining = left.count() > 0 ? static_cast<std::uint32_t>(left.count()) : 0;
+    return prompt;
+  }
+  lc::CloudResult checkAccess() override { return lc::cloudOk(); }
+  lc::CloudResult disconnect() override {
+    secret_.clear(); linked_ = false; state_ = lc::CloudLinkState::kIdle;
+    return lc::cloudOk();
+  }
+  bool storageIsEncrypted() const override { return false; }
+
+ private:
+  std::string clientId_;
+  std::string secret_;
+  mutable bool linked_ = false;
+  mutable lc::CloudLinkState state_ = lc::CloudLinkState::kIdle;
+  mutable std::chrono::steady_clock::time_point startedAt_;
+};
+
 class HostNetworkManager final : public lc::INetworkManager {
  public:
   HostNetworkManager() {
@@ -251,6 +372,10 @@ struct Rig {
   ConfigApplier applier{devices, processing, channels, &calibrations};
   HostSystemMetrics metrics{root};
   HostNetworkManager network;
+  lc::CloudUploadQueue cloudQueue{backend};
+  lc::CloudManager cloud{clock, cloudQueue, events};
+  HostCloudAccount cloudAccount;
+  HostCloudProvider cloudProvider;
   platform::HostBusProvider buses;
   SystemManager system;
   RestApi api;
@@ -262,6 +387,12 @@ struct Rig {
         api(makeApiServices()) {
     applier.setControl(&control);
     applier.setSafety(&safety);
+    cloud.setProvider(&cloudProvider);
+    cloud.setNetwork(&network);
+    cloud.setStorage(&backend);
+    cloud.setControllerId("esp32-a1b2c3");
+    cloud.setEnabled(true);
+    cloud.begin();
   }
 
   SystemManager::Services makeSystemServices() {
@@ -314,6 +445,8 @@ struct Rig {
     services.system = &system;
     services.metrics = &metrics;
     services.network = &network;
+    services.cloud = &cloud;
+    services.cloudAccount = &cloudAccount;
     services.buses = &buses;
     return services;
   }

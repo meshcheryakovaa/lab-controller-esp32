@@ -17,6 +17,7 @@ import type {
   LogEntry, LoggingStatus, LoopMode, ModuleManifest, OutputState, RunRecord,
   RunStatus, SafetyLimit,
   NetworkStatus, NetworkScan, NetworkState, ScanState,
+  CloudStatus, CloudQueue, CloudLinkPrompt, CloudLinkState,
 } from './types';
 import type { Dashboard, DashboardSummary } from './widgets';
 
@@ -393,4 +394,37 @@ export const api = {
 
   setHostname: (hostname: string) =>
     request<{ hostname: string }>('PUT', '/network/hostname', { hostname }),
+
+  // --- M17: offloading to Yandex Disk --------------------------------------
+  cloud: () => request<CloudStatus>('GET', '/cloud'),
+  cloudQueue: () => request<CloudQueue>('GET', '/cloud/queue'),
+
+  /** An empty clientSecret means "leave the stored one alone" — the page cannot
+   *  show it, so it must not force a re-type to change something else. */
+  saveCloudConfig: (config: {
+    clientId?: string; clientSecret?: string; clearClientSecret?: boolean;
+    rootPath?: string; enabled?: boolean;
+  }) => request<CloudStatus>('PUT', '/cloud/yandex/config', config),
+
+  /** Starts Device Code.  Returns the code to type; the controller does the
+   *  polling of Yandex itself, so this works with the browser closed. */
+  beginCloudLink: () =>
+    request<CloudLinkPrompt>('POST', '/cloud/yandex/device-code', {}),
+  cloudLinkStatus: () =>
+    request<{ state: CloudLinkState; expiresIn: number }>(
+      'GET', '/cloud/yandex/device-code/status'),
+
+  testCloudAccess: () => request<{ ok: boolean }>('POST', '/cloud/yandex/test', {}),
+
+  disconnectCloud: (password: string) =>
+    request<{ disconnected: boolean; revokedRemotely: boolean; note: string }>(
+      'DELETE', '/cloud/yandex/credentials', { password }),
+
+  pauseCloudQueue: (paused: boolean) =>
+    request<{ paused: boolean }>(
+      'POST', `/cloud/queue/${paused ? 'pause' : 'resume'}`, {}),
+
+  /** By id only.  A client never names a path or an upload URL. */
+  retryCloudJob: (jobId: number) =>
+    request<{ retrying: number }>('POST', '/cloud/queue/retry', { jobId }),
 };

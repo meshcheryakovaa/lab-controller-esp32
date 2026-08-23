@@ -33,6 +33,19 @@ class IStorageBackend {
   virtual Result<std::size_t> read(const char* path, char* buffer,
                                    std::size_t capacity) const = 0;
 
+  /**
+   * Reads at most `bytes` starting at `offset`.  Returns how many were read;
+   * fewer than asked means end of file, and zero means offset was at or past
+   * the end.  NOT NUL-terminated: this is for binary streaming.
+   *
+   * M17.  read() above takes the whole file, which is right for a
+   * configuration document and impossible for a 100 KiB CSV segment on a
+   * device with about that much usable heap.  The cloud uploader walks a
+   * segment 4 KiB at a time through this, so the file is never in RAM whole.
+   */
+  virtual Result<std::size_t> readAt(const char* path, std::size_t offset,
+                                     char* buffer, std::size_t bytes) const = 0;
+
   // Writes via "<path>.tmp" and renames.  Implementations MUST make the rename
   // the last step so that an interrupted write leaves the old file intact.
   virtual Status writeAtomic(const char* path, const char* data,

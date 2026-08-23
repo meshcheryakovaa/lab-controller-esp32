@@ -16,6 +16,7 @@ SOURCES := \
   $(FIRMWARE)/storage/CalibrationStore.cpp \
   $(FIRMWARE)/storage/ControlStore.cpp \
   $(FIRMWARE)/storage/ExperimentStore.cpp \
+  $(FIRMWARE)/storage/CloudUploadQueue.cpp \
   $(FIRMWARE)/storage/RunLog.cpp \
   $(FIRMWARE)/storage/LogStore.cpp \
   $(FIRMWARE)/storage/DashboardStore.cpp \

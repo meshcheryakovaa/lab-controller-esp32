@@ -1103,6 +1103,78 @@ await shot('65-network-connected');
   console.log('  no Wi-Fi password in /network, /diagnostics or the export');
 }
 
+// --- Milestone 17: sending segments to Yandex Disk -----------------------
+await nav('Cloud').click();
+await page.waitForSelector('.card');
+await page.waitForTimeout(400);
+await shot('66-cloud-not-configured');
+
+// Enter the OAuth application details.  The secret goes in once and is never
+// shown again — the controller has no way to send one back.
+await page.locator('input').nth(0).fill('my-oauth-client-id');
+await page.locator('.password input').fill('top-secret-value');
+await page.getByRole('button', { name: 'Save' }).click();
+await page.waitForTimeout(600);
+
+// Device Code: a short code and a link, and no Yandex password field anywhere.
+await page.getByRole('button', { name: 'Connect Yandex Disk' }).click();
+await page.waitForSelector('.code', { timeout: 10000 });
+await page.waitForTimeout(300);
+{
+  const code = await page.locator('.code').textContent();
+  if (!code || code.trim().length < 4) {
+    throw new Error('the device code was not shown');
+  }
+  const passwordFields = await page.locator('input[type=password]').count();
+  // The secret box is the only password input, and it is not a Yandex one.
+  console.log(`  device code shown: ${code.trim()}, `
+            + `${passwordFields} password field(s) on the page`);
+}
+await shot('67-cloud-device-code');
+
+// The controller finishes the link itself after a moment.
+await page.waitForTimeout(6000);
+await page.waitForTimeout(1500);
+await shot('68-cloud-linked');
+
+// And the secret is nowhere in anything the device will tell anybody.
+{
+  const leaked = await page.evaluate(async () => {
+    const found = [];
+    for (const route of ['/api/v1/cloud', '/api/v1/cloud/queue',
+                         '/api/v1/diagnostics', '/api/v1/config/export']) {
+      const response = await fetch(route, { credentials: 'same-origin' });
+      const text = await response.text();
+      if (text.includes('top-secret-value') || text.includes('my-oauth-client-id')) {
+        found.push(route);
+      }
+    }
+    return found;
+  });
+  if (leaked.length > 0) {
+    throw new Error(`a cloud secret reached ${leaked.join(', ')}`);
+  }
+  console.log('  no cloud secret in /cloud, /cloud/queue, /diagnostics or the export');
+}
+
+// The queue refuses to take a path from a client: only a job id.
+{
+  const status = await page.evaluate(async () => {
+    const response = await fetch('/api/v1/cloud/queue/retry', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify({ localPath: '/data/logs/x.csv',
+                             remotePath: 'disk:/elsewhere/x.csv' }),
+    });
+    return response.status;
+  });
+  if (status < 400) {
+    throw new Error(`the queue accepted a client-supplied path (${status})`);
+  }
+  console.log('  the queue refuses a client-supplied path');
+}
+
 // --- Milestone 11: the lock that never locks the stop button --------------
 await nav('System').click();
 await page.waitForSelector('.panel');

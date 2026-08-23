@@ -52,6 +52,16 @@ enum class EventType : std::uint8_t {
   // A notification only — the page re-reads GET /network, which stays the
   // source of truth, so a dropped frame delays a refresh and never misleads.
   kNetworkStateChanged,
+  // M17: the cloud uploader.  Deliberately few types — one per thing an
+  // operator would act on — because every event costs a slot in a 32-bit mask.
+  kCloudAuthorized,
+  kCloudAuthExpired,
+  kCloudUploadQueued,
+  kCloudUploadStarted,
+  kCloudUploadVerified,
+  kCloudUploadRetry,
+  kCloudUploadConflict,
+  kCloudUploadFailed,
   kSystemMessage,
 
   kCount  // keep last; must stay <= 32 (mask is a uint32)

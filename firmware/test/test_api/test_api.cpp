@@ -60,6 +60,60 @@ class FakeSink final : public IWebSocketSink {
  * hostname is validated.  This fake makes those ordinary host assertions, and
  * records the password purely so a test can prove the API never returns it.
  */
+/**
+ * A cloud account with no cloud (M17).
+ *
+ * It records the secrets it is given purely so a test can prove they never come
+ * back out — which is the one rule these routes exist to keep.
+ */
+class FakeCloudAccount final : public ICloudAccount {
+ public:
+  std::string clientId;
+  std::string secret;
+  bool linked = false;
+  CloudLinkState link = CloudLinkState::kIdle;
+  int beginLinkCalls = 0;
+  int disconnectCalls = 0;
+  int checkCalls = 0;
+
+  bool configured() const override { return !clientId.empty(); }
+  bool clientSecretSet() const override { return !secret.empty(); }
+  bool authorized() const override { return linked; }
+  EpochMs tokenExpiresAtEpochMs() const override { return linked ? 1787482800000ull : 0; }
+
+  Status setClientId(const char* value) override {
+    clientId = value != nullptr ? value : "";
+    return ok();
+  }
+  Status setClientSecret(const char* value) override {
+    secret = value != nullptr ? value : "";
+    return ok();
+  }
+  Status clearClientSecret() override { secret.clear(); return ok(); }
+
+  CloudResult beginLink() override {
+    ++beginLinkCalls;
+    link = CloudLinkState::kWaitingUser;
+    return cloudOk();
+  }
+  CloudLinkState linkState() const override { return link; }
+  CloudLinkPrompt linkPrompt() const override {
+    CloudLinkPrompt prompt;
+    prompt.userCode.assign("ABCD-1234");
+    prompt.verificationUrl.assign("https://oauth.yandex.ru/device");
+    prompt.secondsRemaining = 241;
+    return prompt;
+  }
+  CloudResult checkAccess() override { ++checkCalls; return cloudOk(); }
+  CloudResult disconnect() override {
+    ++disconnectCalls;
+    secret.clear();
+    linked = false;
+    return cloudOk();
+  }
+  bool storageIsEncrypted() const override { return false; }
+};
+
 class FakeNetworkManager final : public INetworkManager {
  public:
   NetworkStatus state;
@@ -167,6 +221,9 @@ struct ApiRig {
   platform::HostBusProvider buses;
   SystemManager system{makeSystemServices()};
   RestApi api{makeApiServices()};
+  FakeCloudAccount cloudAccount;
+  CloudUploadQueue cloudQueue{backend};
+  CloudManager cloud{clock, cloudQueue, events};
   FakeNetworkManager network;
   FakeSink sink;
   TelemetryBatcher telemetry{channels, clock};
@@ -222,6 +279,8 @@ struct ApiRig {
     services.system = &system;
     services.metrics = &metrics;
     services.network = &network;
+    services.cloud = &cloud;
+    services.cloudAccount = &cloudAccount;
     services.buses = &buses;
     services.reboot = countReboot;
     return services;
@@ -3167,6 +3226,168 @@ static void test_a_build_without_a_radio_says_so_rather_than_pretending() {
   TEST_ASSERT_EQUAL_INT(501, outgoing.status);
 }
 
+
+// ===========================================================================
+//  Milestone 17 — the cloud routes.
+//
+//  The rule: no secret ever comes back out, and no handler here does network
+//  work.  Both are checked rather than asserted in a comment.
+// ===========================================================================
+
+static void test_a_cloud_secret_never_comes_back_out() {
+  ApiRig rig;
+  prepareRig(rig);
+  rig.signIn();
+
+  const ApiResponse saved = rig.call(HttpMethod::kPut,
+      "/api/v1/cloud/yandex/config", "",
+      R"({"clientId":"my-client-id","clientSecret":"top-secret-value",
+          "rootPath":"disk:/LabController","enabled":true})");
+  TEST_ASSERT_EQUAL_INT(200, saved.status);
+  // It reached the store...
+  TEST_ASSERT_EQUAL_STRING("top-secret-value", rig.cloudAccount.secret.c_str());
+
+  // ...and appears in no answer anywhere.  ICloudAccount has no method that
+  // could return it, so this is a property of the design, not of a filter.
+  for (const char* route : {"/api/v1/cloud", "/api/v1/cloud/queue",
+                            "/api/v1/diagnostics", "/api/v1/config/export"}) {
+    std::string text;
+    serializeJson(rig.get(route).body, text);
+    TEST_ASSERT_TRUE(text.find("top-secret-value") == std::string::npos);
+    TEST_ASSERT_TRUE(text.find("my-client-id") == std::string::npos);
+  }
+
+  // What it DOES say is whether a secret is remembered — the only question the
+  // interface actually has.
+  const ApiResponse status = rig.get("/api/v1/cloud");
+  TEST_ASSERT_TRUE(status.body["clientSecretSet"].as<bool>());
+  TEST_ASSERT_TRUE(status.body["configured"].as<bool>());
+  // And it admits, rather than hides, that this flash is not encrypted.
+  TEST_ASSERT_FALSE(status.body["secureStorage"].as<bool>());
+}
+
+static void test_an_empty_secret_means_leave_it_alone() {
+  ApiRig rig;
+  prepareRig(rig);
+  rig.signIn();
+  rig.cloudAccount.secret = "already-stored";
+
+  // The interface cannot show the stored secret, so it must not be forced to
+  // re-type it in order to change something else on the same form.
+  const ApiResponse saved = rig.call(HttpMethod::kPut,
+      "/api/v1/cloud/yandex/config", "",
+      R"({"rootPath":"disk:/Other","clientSecret":""})");
+  TEST_ASSERT_EQUAL_INT(200, saved.status);
+  TEST_ASSERT_EQUAL_STRING("already-stored", rig.cloudAccount.secret.c_str());
+
+  // Erasing is possible, but only by asking for it explicitly.
+  const ApiResponse cleared = rig.call(HttpMethod::kPut,
+      "/api/v1/cloud/yandex/config", "", R"({"clearClientSecret":true})");
+  TEST_ASSERT_EQUAL_INT(200, cleared.status);
+  TEST_ASSERT_TRUE(rig.cloudAccount.secret.empty());
+}
+
+static void test_linking_hands_over_a_code_and_does_not_wait() {
+  ApiRig rig;
+  prepareRig(rig);
+  rig.signIn();
+
+  const ApiResponse started =
+      rig.post("/api/v1/cloud/yandex/device-code", "{}");
+  TEST_ASSERT_EQUAL_INT(200, started.status);
+  // A code to type and a place to type it — and no Yandex password field
+  // anywhere, which is the whole reason Device Code was chosen.
+  TEST_ASSERT_EQUAL_STRING("ABCD-1234", started.body["userCode"]);
+  TEST_ASSERT_EQUAL_STRING("https://oauth.yandex.ru/device",
+                           started.body["verificationUrl"]);
+  TEST_ASSERT_EQUAL_INT(1, rig.cloudAccount.beginLinkCalls);
+
+  // The polling of Yandex happens on the worker task; the page polls US.
+  const ApiResponse progress = rig.get("/api/v1/cloud/yandex/device-code/status");
+  TEST_ASSERT_EQUAL_INT(200, progress.status);
+  TEST_ASSERT_EQUAL_STRING("WAITING_USER", progress.body["state"]);
+}
+
+static void test_the_queue_accepts_a_job_id_and_nothing_else() {
+  ApiRig rig;
+  prepareRig(rig);
+  rig.signIn();
+
+  // A client never supplies a path or an upload URL: those decide where
+  // somebody's measurements are written, and they are the controller's to make.
+  const ApiResponse refused = rig.post("/api/v1/cloud/queue/retry",
+      R"({"localPath":"/data/logs/x.csv",
+          "remotePath":"disk:/elsewhere/x.csv"})");
+  TEST_ASSERT_TRUE(refused.isError());
+  TEST_ASSERT_EQUAL_STRING("jobId", refused.body["error"]["field"]);
+
+  const ApiResponse missing = rig.post("/api/v1/cloud/queue/retry",
+                                       R"({"jobId":4242})");
+  TEST_ASSERT_TRUE(missing.isError());
+
+  // Pause and resume are persisted decisions, not momentary ones.
+  TEST_ASSERT_EQUAL_INT(200, rig.post("/api/v1/cloud/queue/pause", "{}").status);
+  TEST_ASSERT_TRUE(rig.cloud.queuePaused());
+  TEST_ASSERT_EQUAL_INT(200, rig.post("/api/v1/cloud/queue/resume", "{}").status);
+  TEST_ASSERT_FALSE(rig.cloud.queuePaused());
+}
+
+static void test_cloud_settings_need_the_right_to_change_settings() {
+  ApiRig rig;
+  prepareRig(rig);
+  TEST_ASSERT_EQUAL_INT(200, rig.post("/api/v1/auth/password",
+      R"({"password":"bench-password"})").status);
+
+  // Reading is fine; storing credentials or unlinking an account is not.
+  TEST_ASSERT_EQUAL_INT(200, rig.get("/api/v1/cloud").status);
+  TEST_ASSERT_EQUAL_INT(401, rig.call(HttpMethod::kPut,
+      "/api/v1/cloud/yandex/config", "", R"({"clientId":"x"})").status);
+  TEST_ASSERT_EQUAL_INT(401,
+      rig.post("/api/v1/cloud/yandex/device-code", "{}").status);
+  TEST_ASSERT_EQUAL_INT(401, rig.call(HttpMethod::kDelete,
+      "/api/v1/cloud/yandex/credentials", "", "").status);
+  TEST_ASSERT_EQUAL_INT(401, rig.post("/api/v1/cloud/queue/pause", "{}").status);
+
+  TEST_ASSERT_EQUAL_INT(0, rig.cloudAccount.beginLinkCalls);
+  TEST_ASSERT_EQUAL_INT(0, rig.cloudAccount.disconnectCalls);
+  TEST_ASSERT_TRUE(rig.cloudAccount.clientId.empty());
+}
+
+static void test_disconnecting_deletes_locally_whatever_the_network_says() {
+  ApiRig rig;
+  prepareRig(rig);
+  rig.signIn();
+  rig.cloudAccount.secret = "top-secret-value";
+  rig.cloudAccount.linked = true;
+
+  const ApiResponse gone = rig.call(HttpMethod::kDelete,
+      "/api/v1/cloud/yandex/credentials", "",
+      R"({"password":"bench-password"})");
+  TEST_ASSERT_EQUAL_INT(200, gone.status);
+  TEST_ASSERT_TRUE(gone.body["disconnected"].as<bool>());
+  TEST_ASSERT_EQUAL_INT(1, rig.cloudAccount.disconnectCalls);
+  TEST_ASSERT_TRUE(rig.cloudAccount.secret.empty());
+  // And it says what a device cannot do for the operator.
+  TEST_ASSERT_TRUE(std::string(gone.body["note"] | "").find("Yandex") !=
+                   std::string::npos);
+}
+
+static void test_a_build_without_a_cloud_says_so() {
+  ApiRig rig;
+  prepareRig(rig);
+  RestApi::Services withoutCloud = rig.makeApiServices();
+  withoutCloud.cloud = nullptr;
+  withoutCloud.cloudAccount = nullptr;
+  RestApi bare(withoutCloud);
+
+  ApiRequest incoming;
+  incoming.method = HttpMethod::kGet;
+  incoming.path = "/api/v1/cloud";
+  ApiResponse outgoing;
+  bare.handle(incoming, outgoing);
+  TEST_ASSERT_EQUAL_INT(501, outgoing.status);
+}
+
 int main(int, char**) {
   UNITY_BEGIN();
   RUN_TEST(test_path_is_split_into_segments);
@@ -3260,5 +3481,12 @@ int main(int, char**) {
   RUN_TEST(test_forgetting_the_network_says_where_to_find_the_device);
   RUN_TEST(test_a_scan_reports_what_it_found_and_does_not_restart_itself);
   RUN_TEST(test_a_build_without_a_radio_says_so_rather_than_pretending);
+  RUN_TEST(test_a_cloud_secret_never_comes_back_out);
+  RUN_TEST(test_an_empty_secret_means_leave_it_alone);
+  RUN_TEST(test_linking_hands_over_a_code_and_does_not_wait);
+  RUN_TEST(test_the_queue_accepts_a_job_id_and_nothing_else);
+  RUN_TEST(test_cloud_settings_need_the_right_to_change_settings);
+  RUN_TEST(test_disconnecting_deletes_locally_whatever_the_network_says);
+  RUN_TEST(test_a_build_without_a_cloud_says_so);
   return UNITY_END();
 }

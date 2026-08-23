@@ -11,6 +11,8 @@
 // =============================================================================
 #include <Arduino.h>
 
+#include <cstring>
+
 #include "api/RestApi.h"
 #include "api/TelemetryBatcher.h"
 #include "api/esp32/Esp32SystemMetrics.h"
@@ -24,7 +26,13 @@
 #include "core/Scheduler.h"
 #include "platform/esp32/Esp32Clock.h"
 #include "platform/esp32/Esp32Random.h"
+#include "platform/esp32/CloudCredentialStore.h"
+#include "platform/esp32/CloudUploadTask.h"
 #include "platform/esp32/NvsBootCounter.h"
+#include "platform/esp32/YandexAccount.h"
+#include "platform/esp32/YandexDiskClient.h"
+#include "platform/esp32/YandexOAuthClient.h"
+#include "storage/CloudUploadQueue.h"
 #include "services/ChannelManager.h"
 #include "services/DeviceManager.h"
 #include "services/ProcessingManager.h"
@@ -67,6 +75,17 @@ LogStore g_logStore(g_backend, g_storage, &g_calibrations);
 platform::Esp32Random g_random;
 AuthManager g_auth(g_clock, g_random, g_backend, g_events);
 ConfigApplier g_applier(g_devices, g_processing, g_channels, &g_calibrations);
+
+// --- M17: the cloud uploader ------------------------------------------------
+// Constructed here like everything else, and like everything else main.cpp
+// knows only how the pieces fit — no OAuth logic and no Yandex Disk paths.
+CloudUploadQueue g_cloudQueue(g_backend);
+CloudManager g_cloud(g_clock, g_cloudQueue, g_events);
+platform::CloudCredentialStore g_cloudStore;
+platform::YandexOAuthClient g_oauth(g_clock, g_cloudStore);
+platform::YandexDiskClient g_disk(g_clock, g_oauth);
+platform::YandexAccount g_cloudAccount(g_cloudStore, g_oauth, g_disk, g_cloud);
+platform::CloudUploadTask g_cloudTask(g_cloud, g_oauth);
 
 platform::Esp32SystemMetrics g_metrics;
 platform::WifiManager g_wifi(g_events);
@@ -133,6 +152,8 @@ RestApi::Services makeApiServices() {
   services.buses = &g_buses;
   services.metrics = &g_metrics;
   services.network = &g_wifi;
+  services.cloud = &g_cloud;
+  services.cloudAccount = &g_cloudAccount;
   services.reboot = requestReboot;
   return services;
 }
@@ -169,6 +190,42 @@ bool startHttp() {
 
 // Until the web UI exists (Milestone 4), the serial console is the only place
 // events can be observed.  It is a subscriber like any other, not a special case.
+/**
+ * Hands the segment that has just closed to the cloud queue (M17).
+ *
+ * Reads the metadata back out of LogStore rather than trusting the event to
+ * carry it: the event exists to say WHEN, and the store is the only thing that
+ * knows the file is finished, how big it is and what its checksum is.
+ */
+void queueClosedSegment(std::uint32_t sequence) {
+  const LogStatus& status = g_logger.status();
+  if (status.id.empty()) return;
+
+  LogStore::SegmentInfo segment;
+  if (!g_logStore.segmentInfo(status.id.c_str(), sequence, segment)) return;
+  // A part a power cut interrupted has no trustworthy checksum, so it is left
+  // for the operator to look at rather than sent as if it were complete.
+  if (!segment.state.equals("READY")) return;
+
+  const char* fileName = std::strrchr(segment.path.c_str(), '/');
+  fileName = (fileName != nullptr) ? fileName + 1 : segment.path.c_str();
+
+  char crc[12];
+  std::snprintf(crc, sizeof(crc), "%08x",
+                static_cast<unsigned>(segment.payloadCrc32));
+  char segmentId[16];
+  std::snprintf(segmentId, sizeof(segmentId), "p%06u",
+                static_cast<unsigned>(segment.sequence));
+
+  const Result<std::uint32_t> queued = g_cloud.enqueueSegment(
+      status.id.c_str(), segmentId, segment.path.c_str(), fileName,
+      segment.bytes, crc);
+  if (!queued.ok()) {
+    Serial.printf("cloud: %s (%s)\n", queued.error().symbol(),
+                  queued.error().detail.c_str());
+  }
+}
+
 void logEvent(const Event& event, void*) {
   Serial.printf("[%s] src=%u code=%s %s\n", toString(event.type),
                 static_cast<unsigned>(event.source), errorSymbol(event.code),
@@ -264,6 +321,43 @@ void setup() {
     Serial.println("  network:    interface ready");
     startHttp();
   }
+
+  // --- M17: the cloud uploader ---------------------------------------------
+  // After storage and network, and on its OWN task: TLS and a 100 KiB upload
+  // must not run on the web server's stack (that shape produced "Stack canary
+  // watchpoint triggered" in 0.15.2) nor on the cooperative scheduler, where a
+  // fifteen-second network wait would sit in front of the safety pass.
+  g_cloudStore.begin();
+  g_oauth.reload();
+  g_cloud.setProvider(&g_disk);
+  g_cloud.setNetwork(&g_wifi);
+  g_cloud.setStorage(&g_backend);
+  g_cloud.setControllerId(g_metrics.controllerId());
+  {
+    lc::FixedString<160> storedRoot;
+    if (g_cloudStore.rootPath(storedRoot)) g_cloud.setRoot(storedRoot.c_str());
+    g_cloud.setEnabled(g_cloudStore.enabled());
+  }
+  const lc::Status cloud = g_cloud.begin();
+  if (!cloud.ok()) {
+    // A queue that will not parse stops the uploader and leaves every CSV
+    // exactly where it is.  Reported loudly; nothing is deleted on a guess.
+    Serial.printf("cloud: %s (%s)\n", cloud.symbol(), cloud.detail.c_str());
+  }
+  const lc::Status cloudTask = g_cloudTask.begin();
+  if (!cloudTask.ok()) {
+    Serial.printf("cloud: %s (%s)\n", cloudTask.symbol(),
+                  cloudTask.detail.c_str());
+  }
+
+  // A closed segment is handed to the queue as it happens.  Subscribed rather
+  // than polled so the upload starts within a second of the rotation, and
+  // filtered to ONE event type so nothing else can accidentally queue a file.
+  g_events.subscribe(lc::eventMask(lc::EventType::kLogSegmentReady),
+                     [](const lc::Event& event, void*) {
+                       if (!g_cloud.enabled()) return;
+                       queueClosedSegment(event.source);
+                     }, nullptr);
 
   const lc::Status telemetry =
       g_telemetry.begin(g_scheduler, g_events, g_http,

@@ -6,6 +6,10 @@ class Preferences {
              const char* partition_label = nullptr);
   void end();
   bool clear();
+  // M17 stores the OAuth token pair as ONE blob; see CloudCredentialStore.
+  std::size_t putBytes(const char* key, const void* value, std::size_t len);
+  std::size_t getBytes(const char* key, void* buf, std::size_t maxLen);
+
   bool remove(const char* key);
   bool isKey(const char* key);
   std::size_t putUChar(const char* key, std::uint8_t value);

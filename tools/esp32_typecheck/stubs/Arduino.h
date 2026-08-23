@@ -35,6 +35,11 @@ void delay(unsigned long ms);
 void delayMicroseconds(unsigned int us);
 void yield();
 
+// esp32-hal-time.h, which the real Arduino.h pulls in.  M17 needs a wall clock
+// before it will talk TLS, and this is what starts SNTP.
+void configTime(long gmtOffset_sec, int daylightOffset_sec, const char* server1,
+                const char* server2 = nullptr, const char* server3 = nullptr);
+
 void pinMode(std::uint8_t pin, std::uint8_t mode);
 void digitalWrite(std::uint8_t pin, std::uint8_t value);
 int digitalRead(std::uint8_t pin);
@@ -81,8 +86,11 @@ class Stream : public Print {
   virtual int available() = 0;
   virtual int read() = 0;
   virtual int peek() = 0;
-  std::size_t readBytes(char* buffer, std::size_t length);
+  // VIRTUAL, as in the real Arduino Stream: M17's upload adapter overrides it
+  // so HTTPClient pulls the file 4 KiB at a time instead of byte by byte.
+  virtual std::size_t readBytes(char* buffer, std::size_t length);
   std::size_t readBytes(std::uint8_t* buffer, std::size_t length);
+  virtual void flush();
 };
 
 class HardwareSerial : public Stream {

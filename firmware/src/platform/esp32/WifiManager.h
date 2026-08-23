@@ -116,6 +116,10 @@ class WifiManager final : public INetworkManager {
   void discardPendingCredentials();
   void onStationConnected(std::uint32_t nowMs);
   void startMdns();
+  /** Point SNTP at a server and let it run.  M17: the cloud uploader cannot
+   *  start without a real wall clock, and nothing else sets one. */
+  void startTimeSync();
+  bool timeSynced() const;
   void enter(NetworkState state, std::uint8_t severity, const char* detail,
              ErrorCode code);
   void collectScanResults();

@@ -58,6 +58,7 @@ SRC="$firmware/src/core/*.cpp
   $firmware/src/storage/ExperimentStore.cpp
   $firmware/src/storage/RunLog.cpp
   $firmware/src/storage/LogStore.cpp
+  $firmware/src/storage/CloudUploadQueue.cpp
   $firmware/src/storage/DashboardStore.cpp
   $firmware/src/storage/PosixBackend.cpp
   $firmware/src/app/*.cpp
@@ -66,7 +67,7 @@ SRC="$firmware/src/core/*.cpp
   $firmware/src/platform/host/*.cpp"
 
 status=0
-for suite in core services devices storage modules api; do
+for suite in core services devices storage modules api cloud; do
   out="$(mktemp -t "lc_test_${suite}.XXXXXX")"
   warnings="$(mktemp -t "lc_warn_${suite}.XXXXXX")"
   # shellcheck disable=SC2086
@@ -82,8 +83,12 @@ for suite in core services devices storage modules api; do
     status=1
   fi
   printf '%-10s ' "$suite"
-  "$out" | tail -1
-  "$out" > /dev/null || status=1
-  rm -f "$out" "$warnings"
+  # Run it once, remember the verdict, and KEEP GOING.  `set -euo pipefail`
+  # used to end the script at the first failing suite, so a failure in `core`
+  # meant the other six were never even built — the run said less the more
+  # there was wrong with the tree.
+  log="$out.log"
+  if "$out" > "$log" 2>&1; then tail -1 "$log"; else tail -1 "$log"; status=1; fi
+  rm -f "$out" "$warnings" "$log"
 done
 exit $status

@@ -4,6 +4,7 @@
 #include <ESPmDNS.h>
 #include <WiFi.h>
 #include <esp_netif.h>
+#include <sys/time.h>
 
 #include <cstdio>
 #include <cstring>
@@ -203,6 +204,32 @@ void WifiManager::startMdns() {
   mdnsStarted_ = true;
 }
 
+// M17.  A wall clock is not a convenience here, it is a precondition: TLS
+// rejects a certificate whose validity window does not contain "now", OAuth
+// token expiry is an absolute time, and a log directory named from a zero epoch
+// would put every session in 1970.  Esp32Clock reports 0 until the RTC is
+// plausible, and CloudManager waits for that rather than guessing — so
+// something has to actually set it, and nothing did before this.
+//
+// Started only with a station: the fallback AP has no route anywhere, and an
+// SNTP client pointed at an unreachable server is only a retry timer.  Called
+// again on a later reconnect while the clock is still implausible, because the
+// first attempt can land before DNS is usable.
+void WifiManager::startTimeSync() {
+  if (timeSynced()) return;  // already set; restarting SNTP would only step it
+  // UTC, no daylight offset: every timestamp this firmware writes — CSV rows,
+  // segment names, token expiry — is epoch UTC, and a local offset here would
+  // silently shift all of them.  time.yandex.ru first because the device that
+  // needs this clock most is talking to Yandex Disk anyway.
+  configTime(0, 0, "time.yandex.ru", "pool.ntp.org", "time.cloudflare.com");
+}
+
+bool WifiManager::timeSynced() const {
+  timeval tv{};
+  if (gettimeofday(&tv, nullptr) != 0) return false;
+  return tv.tv_sec >= 1600000000;  // the same 2020-09-13 floor as Esp32Clock
+}
+
 void WifiManager::enter(NetworkState state, std::uint8_t severity,
                         const char* detail, ErrorCode code) {
   const bool changed = state_ != state;
@@ -333,6 +360,7 @@ void WifiManager::onStationConnected(std::uint32_t nowMs) {
   ++reconnects_;
   if (testing_) adoptPendingCredentials();
   startMdns();
+  startTimeSync();
   enter(NetworkState::kStationConnected, 1, "station connected", ErrorCode::kOk);
 }
 

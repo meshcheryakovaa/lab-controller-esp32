@@ -49,8 +49,8 @@ void RestApi::handle(const ApiRequest& request, ApiResponse& response) {
     for (const char* name :
          {"system", "diagnostics", "modules", "gpio", "buses", "devices",
           "channels", "processing", "calibrations", "outputs", "control",
-          "experiments", "logs", "network", "auth", "firmware", "dashboards",
-          "config"}) {
+          "experiments", "logs", "network", "cloud", "auth", "firmware",
+          "dashboards", "config"}) {
       resources.add(name);
     }
     return;
@@ -99,6 +99,8 @@ void RestApi::handle(const ApiRequest& request, ApiResponse& response) {
     handleLogs(request, path, response);
   } else if (std::strcmp(group, "network") == 0) {
     handleNetwork(request, path, response);
+  } else if (std::strcmp(group, "cloud") == 0) {
+    handleCloud(request, path, response);
   } else if (std::strcmp(group, "auth") == 0) {
     handleAuth(request, path, response);
   } else if (std::strcmp(group, "firmware") == 0) {
@@ -3101,6 +3103,207 @@ void RestApi::handleNetwork(const ApiRequest& request, const PathSegments& path,
     return;
   }
   serializeNetwork(*s_.network, response.body.to<JsonObject>());
+}
+
+
+// ===========================================================================
+//  Milestone 17 — the cloud account and the upload queue.
+//
+//  THE RULE THESE ROUTES ENFORCE: no secret ever comes back out.
+//
+//  Not by redacting one on the way past — by there being nothing to redact.
+//  ICloudAccount has no method that returns a client secret or a token, so no
+//  handler here can serialise one even by mistake.  What the interface gets is
+//  `clientSecretSet: true`, which answers the only question it actually has.
+//
+//  And no handler here does network work.  Linking an account and testing
+//  access both hand the job to the worker task and answer immediately: TLS and
+//  a 100 KiB upload on the web server's stack is exactly the shape that
+//  produced "Stack canary watchpoint triggered (httpd)" in 0.15.2.
+// ===========================================================================
+void RestApi::handleCloud(const ApiRequest& request, const PathSegments& path,
+                          ApiResponse& response) {
+  if (s_.cloud == nullptr || s_.cloudAccount == nullptr) {
+    response.setError(501, fail(ErrorCode::kNotSupported,
+                                "this build has no cloud uploader"));
+    return;
+  }
+
+  // --- the queue ------------------------------------------------------------
+  if (path.count() >= 4 && path.is(3, "queue")) {
+    if (path.count() == 4) {
+      if (request.method != HttpMethod::kGet) {
+        response.setError(405, fail(ErrorCode::kNotSupported, "use GET"));
+        return;
+      }
+      s_.cloud->describe(response.body.to<JsonObject>());
+      return;
+    }
+    if (request.method != HttpMethod::kPost) {
+      response.setError(405, fail(ErrorCode::kNotSupported, "use POST"));
+      return;
+    }
+    if (!requireWriteAccess(request, response)) return;
+
+    if (path.is(4, "pause") || path.is(4, "resume")) {
+      const bool pause = path.is(4, "pause");
+      const Status changed = s_.cloud->setQueuePaused(pause);
+      if (!changed.ok()) { response.setError(changed); return; }
+      JsonObject out = response.body.to<JsonObject>();
+      out["paused"] = pause;
+      return;
+    }
+    if (path.is(4, "retry")) {
+      JsonDocument body;
+      if (!parseBody(request, body, response)) return;
+      // Only an id.  A client never supplies a local path, a remote path or an
+      // upload URL: those are the controller's to decide, and accepting them
+      // would be accepting instructions about where to write somebody's data.
+      const std::uint32_t jobId = body["jobId"] | 0u;
+      if (jobId == 0) {
+        response.setError(fail(ErrorCode::kInvalidArgument, "jobId is required"));
+        response.body["error"]["field"] = "jobId";
+        return;
+      }
+      const Status retried = s_.cloud->retry(jobId);
+      if (!retried.ok()) { response.setError(retried); return; }
+      JsonObject out = response.body.to<JsonObject>();
+      out["retrying"] = jobId;
+      return;
+    }
+    response.setError(404, fail(ErrorCode::kNotFound, "cloud queue endpoint"));
+    return;
+  }
+
+  // --- the account ----------------------------------------------------------
+  if (path.count() >= 5 && path.is(3, "yandex")) {
+    if (path.is(4, "config")) {
+      if (request.method != HttpMethod::kPut) {
+        response.setError(405, fail(ErrorCode::kNotSupported, "use PUT"));
+        return;
+      }
+      if (!requireWriteAccess(request, response)) return;
+      JsonDocument body;
+      if (!parseBody(request, body, response)) return;
+
+      const char* clientId = body["clientId"] | "";
+      if (clientId[0] != '\0') {
+        const Status applied = s_.cloudAccount->setClientId(clientId);
+        if (!applied.ok()) { response.setError(applied); return; }
+      }
+      // An empty secret means "leave it alone", because the interface cannot
+      // show the stored one and must not be forced to re-type it to change
+      // something else.  Erasing needs the explicit flag below.
+      const char* secret = body["clientSecret"] | "";
+      if (secret[0] != '\0') {
+        const Status applied = s_.cloudAccount->setClientSecret(secret);
+        if (!applied.ok()) { response.setError(applied); return; }
+      }
+      if (body["clearClientSecret"] | false) {
+        s_.cloudAccount->clearClientSecret();
+      }
+      if (body["rootPath"].is<const char*>()) {
+        const Status applied = s_.cloud->setRoot(body["rootPath"] | "");
+        if (!applied.ok()) {
+          response.setError(applied);
+          response.body["error"]["field"] = "rootPath";
+          return;
+        }
+      }
+      if (body["enabled"].is<bool>()) {
+        s_.cloud->setEnabled(body["enabled"].as<bool>());
+      }
+      describeCloud(response.body.to<JsonObject>());
+      return;
+    }
+
+    if (path.is(4, "device-code")) {
+      if (path.count() >= 6 && path.is(5, "status")) {
+        if (request.method != HttpMethod::kGet) {
+          response.setError(405, fail(ErrorCode::kNotSupported, "use GET"));
+          return;
+        }
+        const CloudLinkPrompt prompt = s_.cloudAccount->linkPrompt();
+        JsonObject out = response.body.to<JsonObject>();
+        out["state"] = toString(s_.cloudAccount->linkState());
+        out["expiresIn"] = prompt.secondsRemaining;
+        return;
+      }
+      if (request.method != HttpMethod::kPost) {
+        response.setError(405, fail(ErrorCode::kNotSupported, "use POST"));
+        return;
+      }
+      if (!requireWriteAccess(request, response)) return;
+      const CloudResult started = s_.cloudAccount->beginLink();
+      if (!started.ok()) { response.setError(started.status); return; }
+
+      const CloudLinkPrompt prompt = s_.cloudAccount->linkPrompt();
+      JsonObject out = response.body.to<JsonObject>();
+      // A code to type and a place to type it.  The Yandex password is never
+      // entered on this instrument, which is why Device Code was chosen.
+      out["userCode"] = jsonCopy(prompt.userCode.c_str());
+      out["verificationUrl"] = jsonCopy(prompt.verificationUrl.c_str());
+      out["expiresIn"] = prompt.secondsRemaining;
+      return;
+    }
+
+    if (path.is(4, "test")) {
+      if (request.method != HttpMethod::kPost) {
+        response.setError(405, fail(ErrorCode::kNotSupported, "use POST"));
+        return;
+      }
+      if (!requireWriteAccess(request, response)) return;
+      const CloudResult checked = s_.cloudAccount->checkAccess();
+      if (!checked.ok()) { response.setError(checked.status); return; }
+      JsonObject out = response.body.to<JsonObject>();
+      out["ok"] = true;
+      return;
+    }
+
+    if (path.is(4, "credentials")) {
+      if (request.method != HttpMethod::kDelete) {
+        response.setError(405, fail(ErrorCode::kNotSupported, "use DELETE"));
+        return;
+      }
+      if (!requireWriteAccess(request, response)) return;
+      // Deleting credentials is as consequential as deleting a dataset, and it
+      // is the action somebody else's browser session could most usefully take.
+      if (!requireConfirmation(request, response,
+                               "disconnecting the cloud account")) return;
+      const CloudResult disconnected = s_.cloudAccount->disconnect();
+      JsonObject out = response.body.to<JsonObject>();
+      out["disconnected"] = true;
+      // The remote revoke is best-effort; the local deletion always happened.
+      out["revokedRemotely"] = disconnected.ok();
+      out["note"] = "access can also be revoked in the Yandex account";
+      return;
+    }
+  }
+
+  // --- GET /cloud -----------------------------------------------------------
+  if (path.count() != 3) {
+    response.setError(404, fail(ErrorCode::kNotFound, "cloud endpoint"));
+    return;
+  }
+  if (request.method != HttpMethod::kGet) {
+    response.setError(405, fail(ErrorCode::kNotSupported, "use GET"));
+    return;
+  }
+  describeCloud(response.body.to<JsonObject>());
+}
+
+void RestApi::describeCloud(JsonObject out) const {
+  s_.cloud->describe(out);
+  out["configured"] = s_.cloudAccount->configured();
+  // The only thing said about the secret: that there IS one.  There is no
+  // method on ICloudAccount that could return it.
+  out["clientSecretSet"] = s_.cloudAccount->clientSecretSet();
+  out["authorized"] = s_.cloudAccount->authorized();
+  out["tokenExpiresAt"] = s_.cloudAccount->tokenExpiresAtEpochMs();
+  out["linkState"] = toString(s_.cloudAccount->linkState());
+  // Stated rather than hidden: a stock ESP32 is not secure storage against
+  // somebody holding the board.  See ADR-0023.
+  out["secureStorage"] = s_.cloudAccount->storageIsEncrypted();
 }
 
 }  // namespace lc

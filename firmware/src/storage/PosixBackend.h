@@ -21,6 +21,8 @@ class PosixBackend final : public IStorageBackend {
   Result<std::size_t> size(const char* path) const override;
   Result<std::size_t> read(const char* path, char* buffer,
                            std::size_t capacity) const override;
+  Result<std::size_t> readAt(const char* path, std::size_t offset, char* buffer,
+                             std::size_t bytes) const override;
   Status writeAtomic(const char* path, const char* data,
                      std::size_t bytes) override;
   Status append(const char* path, const char* data, std::size_t bytes) override;

@@ -44,6 +44,10 @@ FILES="
   src/buses/esp32/WireI2cBus.cpp
   src/api/esp32/PsychicHttpAdapter.cpp
   src/platform/esp32/WifiManager.cpp
+  src/platform/esp32/CloudCredentialStore.cpp
+  src/platform/esp32/YandexOAuthClient.cpp
+  src/platform/esp32/YandexDiskClient.cpp
+  src/platform/esp32/CloudUploadTask.cpp
   src/storage/LittleFsBackend.cpp
   src/main.cpp
 "
