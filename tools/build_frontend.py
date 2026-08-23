@@ -29,9 +29,9 @@ apart.  So now:
     that teaches you to distrust the tool.
   * data/www is replaced only after a build succeeds.  A failed build leaves the
     previous, working assets in place rather than an empty directory.
-  * Compressible assets are stored ONLY as .gz.  PsychicHttp transparently
-    serves the compressed twin for the original URL, so keeping both copies
-    wastes more than 300 KiB of the LittleFS partition.
+  * Large compressible assets are stored ONLY as .gz.  Tiny gzip payloads stay
+    raw because PsychicHttp 3.1.2 routes files below FILE_CHUNK_SIZE through a
+    text String and corrupts binary data at the first NUL byte.
   * Skipping is FATAL for filesystem targets (uploadfs / buildfs).  Uploading an
     empty image is not a lesser version of uploading the UI; it is the thing
     that wasted the evening.
@@ -193,7 +193,16 @@ def stage_into_littlefs():
                 with gzip.GzipFile(filename="", mode="wb", compresslevel=9,
                                    fileobj=raw_dst, mtime=0) as dst:
                     shutil.copyfileobj(src, dst)
-            total_stored += os.path.getsize(target)
+            # Keep a small response textual.  PsychicHttp 3.1.2 copies files
+            # below FILE_CHUNK_SIZE into std::string using a C-string
+            # assignment, which truncates gzip data on its first NUL byte.
+            # This must match FILE_CHUNK_SIZE in platformio.ini.
+            if os.path.getsize(target) < 2 * 1024:
+                os.remove(target)
+                shutil.copy2(source, os.path.join(target_root, name))
+                total_stored += raw_size
+            else:
+                total_stored += os.path.getsize(target)
 
     if files_staged == 0:
         sys.stderr.write("[frontend] dist/ was empty; nothing to serve\n")
