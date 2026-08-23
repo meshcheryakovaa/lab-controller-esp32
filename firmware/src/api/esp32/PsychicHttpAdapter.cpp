@@ -209,7 +209,16 @@ esp_err_t PsychicHttpAdapter::handleHealth(PsychicRequest* request,
 esp_err_t PsychicHttpAdapter::sendFile(PsychicResponse* response,
                                        const char* path, const char* contentType,
                                        const char* cacheControl) {
-  // PsychicFileResponse streams anything over 8 KB in chunks, so a 300 KB
+  // Resolve the gzip twin ourselves.  Letting PsychicFileResponse probe the
+  // missing raw path first makes LittleFS emit a frightening VFS error for a
+  // normal, valid gzip-only asset.
+  const String rawPath(path);
+  const String gzipPath = rawPath + ".gz";
+  const bool useGzip = !LittleFS.exists(rawPath) && LittleFS.exists(gzipPath);
+  const char* storedPath = useGzip ? gzipPath.c_str() : rawPath.c_str();
+
+  // PsychicFileResponse streams anything over FILE_CHUNK_SIZE in chunks, so a
+  // 300 KB
   // bundle costs a buffer rather than the whole file in RAM.
   //
   // setCode() BEFORE send() is not optional.  The chunked path calls
@@ -220,7 +229,8 @@ esp_err_t PsychicHttpAdapter::sendFile(PsychicResponse* response,
   // failure looked like "large assets are broken" — which is how it was found,
   // the expensive way, on hardware.
   response->setCode(200);
-  PsychicFileResponse file(response, LittleFS, path, contentType);
+  PsychicFileResponse file(response, LittleFS, storedPath, contentType);
+  if (useGzip) file.addHeader("Content-Encoding", "gzip");
   // Set after construction: addHeader replaces a field it already holds, and
   // PsychicFileResponse adds its own Content-Disposition and (for a .gz twin)
   // Content-Encoding.
