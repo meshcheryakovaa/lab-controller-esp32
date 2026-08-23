@@ -415,7 +415,7 @@ static void test_the_same_password_with_a_different_salt_is_a_different_hash() {
 //
 //  The budget is expressed in HOST bytes, where a pointer is eight and the
 //  ESP32's is four, so this figure is an upper bound on what the target pays.
-//  96 KB here corresponds to comfortably under the ~176 KB of DRAM an ESP32
+//  64 KB here corresponds to comfortably under the ~176 KB of DRAM an ESP32
 //  DevKit has for .data + .bss — the rest belongs to the heap, the Wi-Fi stack
 //  and the HTTP task, and a firmware that leaves them nothing boots and then
 //  dies the first time somebody opens a page.
@@ -425,7 +425,7 @@ static void test_the_same_password_with_a_different_salt_is_a_different_hash() {
 //  Raising the budget is a decision, not a fix.
 // ---------------------------------------------------------------------------
 static void test_the_static_footprint_stays_within_budget() {
-  constexpr std::size_t kBudgetBytes = 96 * 1024;
+  constexpr std::size_t kBudgetBytes = 64 * 1024;
 
   const std::size_t total =
       sizeof(ChannelManager) + sizeof(DeviceManager) + sizeof(ExperimentEngine) +

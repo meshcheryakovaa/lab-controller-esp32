@@ -71,21 +71,24 @@ inline constexpr ChannelHandle kInvalidChannel = 0;
 //  The reductions are not free and the trade is written down next to each one.
 // =============================================================================
 namespace limits {
-// Sixteen devices and forty-eight channels: an ESP32 DevKit has 34 GPIOs, two
-// I2C buses and one ADC worth using, so a rig that needs a seventeenth device
-// has outgrown the board rather than the firmware.  Together these two lines
-// are 22 KB of the 10.6 KB that had to go.
-inline constexpr std::size_t kMaxDevices = 16;
-inline constexpr std::size_t kMaxChannels = 48;
-inline constexpr std::size_t kMaxProcessorsPerChannel = 6;
-inline constexpr std::size_t kMaxSchedulerTasks = 48;
-inline constexpr std::size_t kMaxEventSubscribers = 24;
+// This WROOM-32 build is sized for the actual laboratory rig, not for a generic
+// catalogue maximum.  Eight devices and twenty-four channels leave 100 % spare
+// capacity over the current five-device / twelve-channel installation while
+// returning the unused slots to DRAM.
+inline constexpr std::size_t kMaxDevices = 8;
+inline constexpr std::size_t kMaxChannels = 24;
+// Four stages still cover calibration + smoothing + derivative + clamp, while
+// avoiding two unused processor records on every channel.
+inline constexpr std::size_t kMaxProcessorsPerChannel = 4;
+inline constexpr std::size_t kMaxSchedulerTasks = 32;
+inline constexpr std::size_t kMaxEventSubscribers = 16;
 inline constexpr std::size_t kMaxChannelSubscribers = 8;
-// One claim per GPIO, ADC input, PWM channel and I2C address in use.  Sixty-four
-// covers every pin the chip has with room to spare; ninety-six could not be
-// reached by any configuration this firmware will accept.
-inline constexpr std::size_t kMaxResourceClaims = 64;
-inline constexpr std::size_t kMaxModuleTypes = 64;
+// One claim per GPIO, ADC input, PWM channel and I2C address in use.  Forty is
+// already greater than the number of useful resources on this board.  The
+// built-in catalogue currently contains 25 module types, so 32 keeps expansion
+// room without paying for 39 empty registry slots forever.
+inline constexpr std::size_t kMaxResourceClaims = 40;
+inline constexpr std::size_t kMaxModuleTypes = 32;
 // Channels that may carry an ACTIVE calibration at the same time.  The version
 // HISTORY is not counted here: it lives in calibrations.json and is read from
 // the file when the editor asks for it (ADR-0014).  Keeping every past fit in
@@ -93,16 +96,16 @@ inline constexpr std::size_t kMaxModuleTypes = 64;
 // Halved with kMaxChannels: a calibration belongs to a measuring channel, and
 // half the channels on a real rig are outputs, states or digital inputs that
 // have nothing to calibrate.
-inline constexpr std::size_t kMaxActiveCalibrations = 24;
+inline constexpr std::size_t kMaxActiveCalibrations = 12;
 // Output channels the safety layer tracks.  Every one of them costs a fixed
 // record and a pass through the kSafety task; the limit is what keeps that
 // pass bounded no matter how the rig is configured.
-inline constexpr std::size_t kMaxOutputs = 24;
+inline constexpr std::size_t kMaxOutputs = 8;
 // Safety limits and control loops.  Both are evaluated every 100 ms at
 // priorities that run before everything else, so both are bounded on purpose.
-inline constexpr std::size_t kMaxSafetyLimits = 16;
-inline constexpr std::size_t kMaxControlLoops = 8;
-inline constexpr std::size_t kMaxRules = 16;
+inline constexpr std::size_t kMaxSafetyLimits = 8;
+inline constexpr std::size_t kMaxControlLoops = 4;
+inline constexpr std::size_t kMaxRules = 8;
 // One experiment runs at a time and only its steps are held in RAM; the other
 // scenarios stay in the file until somebody starts them.  Sixteen steps is
 // still a long scenario — the evaporation run in the brief is eight — and it

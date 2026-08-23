@@ -8,7 +8,10 @@
 namespace lc {
 namespace {
 
-constexpr std::size_t kHashBufferBytes = 4096;
+// Hashing is background work and gains little from a 4 KiB stack allocation.
+// A 1 KiB chunk keeps the worker's peak stack use bounded while still reading
+// the segment sequentially.
+constexpr std::size_t kHashBufferBytes = 1024;
 constexpr const char* kDefaultRoot = "disk:/LabController";
 
 }  // namespace
