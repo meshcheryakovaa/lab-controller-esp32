@@ -93,10 +93,9 @@ inline constexpr std::size_t kMaxModuleTypes = 32;
 // HISTORY is not counted here: it lives in calibrations.json and is read from
 // the file when the editor asks for it (ADR-0014).  Keeping every past fit in
 // RAM would cost kilobytes to serve a page nobody has open.
-// Halved with kMaxChannels: a calibration belongs to a measuring channel, and
-// half the channels on a real rig are outputs, states or digital inputs that
-// have nothing to calibrate.
-inline constexpr std::size_t kMaxActiveCalibrations = 12;
+// One active calibration per channel.  Keeping this equal to kMaxChannels also
+// preserves the deliberately-truncated calibration-list path in CSV headers.
+inline constexpr std::size_t kMaxActiveCalibrations = 24;
 // Output channels the safety layer tracks.  Every one of them costs a fixed
 // record and a pass through the kSafety task; the limit is what keeps that
 // pass bounded no matter how the rig is configured.
